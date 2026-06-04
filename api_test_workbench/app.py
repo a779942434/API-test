@@ -326,10 +326,10 @@ for i, step in enumerate(steps):
         curl_col1, curl_col2 = st.columns([4, 1])
         with curl_col1:
             curl_input = st.text_area(
-                "粘贴 curl 命令（可选，点击「解析」自动填充上方字段）",
+                "粘贴 curl（可选，点「解析」自动填充）",
                 key=f"step_curl_{i}",
                 height=80,
-                placeholder="curl -X POST 'http://example.com/api' -H 'Content-Type: application/json' -d '{\"key\": \"value\"}'",
+                placeholder='''curl -X POST 'http://example.com/api' -H 'Content-Type: application/json' -d '{"page":1,"size":30}' ''',
             )
         with curl_col2:
             st.write("")
@@ -377,7 +377,7 @@ for i, step in enumerate(steps):
             except json.JSONDecodeError:
                 st.warning("Headers JSON 格式错误")
         with col_b:
-            body_str = st.text_area("Body 模板 (JSON)", value=json.dumps(step.config.body_template, ensure_ascii=False, indent=2), height=80, key=f"step_body_{i}_v{ver}", help="步骤间数据传递请在下方「字段定义」中用自然语言描述，无需手动写占位符")
+            body_str = st.text_area("Body 模板 (JSON)", value=json.dumps(step.config.body_template, ensure_ascii=False, indent=2), height=80, key=f"step_body_{i}_v{ver}", help="步骤间数据依赖在下方「字段定义」中描述")
             try:
                 step.config.body_template = json.loads(body_str)
             except json.JSONDecodeError:
