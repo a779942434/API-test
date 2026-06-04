@@ -137,9 +137,25 @@ def build_pipeline_user_prompt(
         steps_block_parts.append("\n".join(parts))
     steps_block = "\n".join(steps_block_parts)
 
-    count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条测试用例"
-    if test_cases_per_step == 1:
-        count_hint += "（只生成核心正向链路用例）"
+    if test_cases_per_step <= 1:
+        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条正向核心用例"
+        extra_rules = "6. 不要生成边界值、异常值、空值等测试用例，只聚焦核心数据链路"
+    elif test_cases_per_step <= 5:
+        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条测试用例，覆盖：正向、边界值、必填项为空"
+        extra_rules = """6. 用例类型分配建议：
+   - 1 条正向用例（正确数据）
+   - 1-2 条边界值用例（min/max、min-1/max+1）
+   - 剩余覆盖必填项缺失、类型错误等异常场景"""
+    else:
+        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条测试用例，全面覆盖：正向、等价类、边界值、异常、跨字段依赖"
+        extra_rules = """6. 用例类型全面覆盖：
+   - 正向：正确数据，验证正常业务
+   - 等价类：不同有效值组合
+   - 边界值：min-1, min, min+1, max-1, max, max+1
+   - 异常：空值/null、类型错误、超长字符串、特殊字符、SQL注入测试
+   - 依赖：跨字段逻辑校验（如 endTime > startTime）、唯一性校验
+   每个字段至少覆盖 2-3 种场景"""
+
     return f"""请根据以下 API Pipeline 描述生成多步骤测试用例。
 
 Pipeline 整体流程：
@@ -153,8 +169,8 @@ Pipeline 整体流程：
 2. 第一步的 input_data 用具体数据填充（写死即可），后续步骤的 input_data 留空 {{}}
 3. 识别步骤间的数据依赖，在 data_dependencies 中用 {{{{stepN.response.path}}}} 格式引用上游数据
 4. 每个步骤标注 output_reference 字段
-5. 所有 expected_status_code 填 200，正向用例 assertion_logic 填 resp_json['code'] == '0'
-6. 不要生成边界值、异常值、空值等测试用例，只聚焦核心数据链路
+5. 所有 expected_status_code 填 200，正向用例 assertion_logic 填 resp_json['code'] == '0'，反向用例填 resp_json['code'] != '0'
+{extra_rules}
 7. input_data 只放需要覆盖/变更的字段，Body 模板中已有的值不要重复
 
 请直接输出 JSON，不要包含任何 Markdown 标记或额外文字。"""

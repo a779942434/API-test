@@ -28,22 +28,29 @@ def _get_api_key() -> str:
         _ANTHROPIC_API_KEY = key
         return key
 
-    try:
-        creds_path = os.path.expanduser("~/.claude/credentials.json")
-        if os.path.exists(creds_path):
-            with open(creds_path) as f:
-                creds = json.load(f)
-            key = creds.get("apiKey") or creds.get("anthropicApiKey")
-            if key:
-                _ANTHROPIC_API_KEY = key
-                return key
-    except Exception:
-        pass
+    for path, key_names in [
+        (os.path.expanduser("~/.claude/credentials.json"), ["apiKey", "anthropicApiKey"]),
+        (os.path.expanduser("~/.claude/settings.json"), ["ANTHROPIC_AUTH_TOKEN"]),
+    ]:
+        try:
+            if os.path.exists(path):
+                with open(path) as f:
+                    data = json.load(f)
+                # settings.json 的 key 在 env 子对象下
+                if "settings" in path or path.endswith("settings.json"):
+                    data = data.get("env", data)
+                for name in key_names:
+                    if data.get(name):
+                        _ANTHROPIC_API_KEY = data[name]
+                        return data[name]
+        except Exception:
+            continue
 
     raise RuntimeError(
         "未找到 API Key。请设置环境变量：\n"
         "  DeepSeek:  export DEEPSEEK_API_KEY=sk-xxx\n"
-        "  Anthropic: export ANTHROPIC_API_KEY=sk-ant-api03-xxx"
+        "  Anthropic: export ANTHROPIC_API_KEY=sk-ant-api03-xxx\n"
+        "或写入 ~/.claude/settings.json 的 env.ANTHROPIC_AUTH_TOKEN 字段"
     )
 
 

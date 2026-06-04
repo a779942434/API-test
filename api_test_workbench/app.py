@@ -26,6 +26,155 @@ from api_test_workbench.engine.bindings import scan_placeholders
 from api_test_workbench.engine.curl_parser import parse_curl
 
 st.set_page_config(page_title="API 测试工作台 — Pipeline", layout="wide")
+
+# ═══════════════════════════════════════════
+# 自定义样式 — 暗色开发者工具风
+# ═══════════════════════════════════════════
+st.markdown("""
+<style>
+/* ===== 全局 ===== */
+.stApp { background: #0F172A; }
+section.main .block-container { padding-top: 1.5rem; max-width: 1400px; }
+
+/* ===== 标题 ===== */
+h1 { font-weight: 700 !important; font-size: 1.75rem !important; color: #F1F5F9 !important;
+     border-left: 4px solid #3B82F6; padding-left: 16px !important; margin-bottom: 1.5rem !important; }
+h2 { font-weight: 600 !important; font-size: 1.25rem !important; color: #CBD5E1 !important; margin-top: 0.5rem !important; }
+h3 { font-weight: 600 !important; font-size: 1.05rem !important; color: #94A3B8 !important; }
+
+/* ===== 卡片容器 ===== */
+.stExpander {
+    background: #1E293B !important;
+    border: 1px solid #334155 !important;
+    border-radius: 10px !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
+    margin-bottom: 12px !important;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease !important;
+}
+.stExpander:hover {
+    border-color: #3B82F6 !important;
+    box-shadow: 0 4px 16px rgba(59,130,246,0.12) !important;
+}
+.stExpander details[open] { border-left: 3px solid #3B82F6 !important; }
+
+/* ===== 按钮 ===== */
+.stButton > button {
+    border-radius: 8px !important;
+    font-weight: 500 !important;
+    font-size: 0.875rem !important;
+    transition: all 0.15s ease !important;
+    border: none !important;
+}
+.stButton > button[kind="primary"] {
+    background: #3B82F6 !important; color: #fff !important;
+    box-shadow: 0 2px 6px rgba(59,130,246,0.3) !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background: #2563EB !important;
+    box-shadow: 0 4px 12px rgba(59,130,246,0.45) !important;
+    transform: translateY(-1px);
+}
+.stButton > button[kind="secondary"] {
+    background: transparent !important; color: #93C5FD !important;
+    border: 1.5px solid #3B82F6 !important;
+}
+.stButton > button[kind="secondary"]:hover {
+    background: rgba(59,130,246,0.12) !important; border-color: #60A5FA !important; color: #BFDBFE !important;
+}
+
+/* ===== 输入框 / 文本域 ===== */
+.stTextInput input, .stTextArea textarea {
+    border-radius: 8px !important;
+    border: 1.5px solid #334155 !important;
+    background: #0F172A !important;
+    color: #E2E8F0 !important;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
+    font-size: 0.875rem !important;
+}
+.stTextInput input::placeholder, .stTextArea textarea::placeholder { color: #64748B !important; }
+.stTextInput input:focus, .stTextArea textarea:focus {
+    border-color: #3B82F6 !important;
+    box-shadow: 0 0 0 3px rgba(59,130,246,0.15) !important;
+}
+
+/* ===== Selectbox ===== */
+.stSelectbox [data-baseweb="select"] > div {
+    background: #0F172A !important;
+    border-color: #334155 !important;
+    border-radius: 8px !important;
+}
+
+/* ===== Tabs ===== */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0px !important;
+    border-bottom: 2px solid #334155 !important;
+    background: transparent !important;
+}
+.stTabs [data-baseweb="tab"] {
+    border-radius: 8px 8px 0 0 !important;
+    padding: 8px 20px !important;
+    font-weight: 500 !important;
+    color: #64748B !important;
+    background: transparent !important;
+    border: none !important;
+    margin-right: 2px !important;
+}
+.stTabs [data-baseweb="tab"][aria-selected="true"] {
+    color: #3B82F6 !important;
+    border-bottom: 2px solid #3B82F6 !important;
+    background: rgba(59,130,246,0.08) !important;
+}
+
+/* ===== Progress 进度条 ===== */
+.stProgress > div > div > div {
+    background: linear-gradient(90deg, #2563EB, #3B82F6) !important;
+    border-radius: 4px !important;
+}
+.stProgress > div { background: #334155 !important; border-radius: 4px !important; }
+
+/* ===== Alert / 消息 ===== */
+.stAlert { border-radius: 8px !important; font-size: 0.875rem !important; }
+div[data-testid="stNotification"] { border-radius: 8px !important; }
+
+/* ===== Data Editor / DataFrame ===== */
+.stDataFrame, .stDataEditor {
+    border-radius: 8px !important;
+    border: 1px solid #334155 !important;
+    overflow: hidden !important;
+}
+.stDataFrame thead th, .stDataEditor thead th {
+    background: #1E293B !important;
+    font-weight: 600 !important;
+    font-size: 0.8rem !important;
+    color: #94A3B8 !important;
+}
+
+/* ===== 分隔线 ===== */
+hr { border-color: #334155 !important; margin: 1.5rem 0 !important; }
+
+/* ===== Caption ===== */
+.stCaption { color: #64748B !important; font-size: 0.8rem !important; }
+
+/* ===== JSON 展示 ===== */
+.stJson { background: #0F172A !important; border-radius: 8px !important; padding: 8px !important; border: 1px solid #334155 !important; }
+
+/* ===== Expander 展开/收起文字 ===== */
+.stExpander details summary { color: #CBD5E1 !important; }
+
+/* ===== 代码块 ===== */
+code { background: #1E293B !important; color: #93C5FD !important; padding: 2px 6px !important; border-radius: 4px !important; }
+
+/* ===== 数字输入 ===== */
+.stNumberInput input {
+    background: #0F172A !important; border-color: #334155 !important;
+    color: #E2E8F0 !important; border-radius: 8px !important;
+}
+
+/* ===== Sidebar 等容器 ===== */
+.st-emotion-cache-1cypcdb { background: #0F172A !important; }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("API 测试工作台 — Pipeline")
 
 # ==================== 初始化 Session State ====================
@@ -128,7 +277,7 @@ def _scan_all_bindings(pipeline: Pipeline) -> list[DataBinding]:
 
 # ==================== ① Pipeline 配置 ====================
 
-st.header("① Pipeline 配置")
+st.header("🔗 ① Pipeline 配置")
 
 # Pipeline 名称
 pipeline_name = st.text_input("链路名称", value=st.session_state.pipeline.name, key="pipeline_name_input")
@@ -278,7 +427,7 @@ elif len(steps) > 1:
 
 # ==================== ② 字段定义 & 生成 ====================
 
-st.header("② 字段定义 & 测试数据生成")
+st.header("📝 ② 字段定义 & 测试数据生成")
 
 st.text_area(
     "粘贴 Pipeline 字段定义（每步接口的字段约束、业务规则、数据依赖）",
@@ -305,8 +454,10 @@ Step 3（更新订单状态）：
 
 gen_col1, gen_col2, _ = st.columns([1.5, 1, 3])
 with gen_col1:
-    test_cases_per_step = st.number_input("每步用例数", min_value=1, max_value=10, value=1, step=1, key="tc_per_step",
-                                          help="Pipeline 模式建议设 1，只生成核心链路")
+    test_cases_per_step = st.number_input(
+        "每步用例数", min_value=1, max_value=25, value=1, step=1, key="tc_per_step",
+        help="1=核心正向链路 | 3-5=含边界值 | 10+=完整覆盖（等价类/边界/异常/依赖）",
+    )
 with gen_col2:
     st.write("")
     generate_clicked = st.button("生成测试数据", type="primary", use_container_width=True)
@@ -401,7 +552,7 @@ if tcs_by_step:
 
 # ==================== ③ 认证 & 执行 ====================
 
-st.header("③ 认证 & 执行")
+st.header("🔐 ③ 认证 & 执行")
 
 # 登录区
 with st.expander("登录认证", expanded=not st.session_state.auth_ok):
