@@ -216,14 +216,14 @@ for i, step in enumerate(steps):
             except json.JSONDecodeError:
                 st.warning("Headers JSON 格式错误")
         with col_b:
-            body_str = st.text_area("Body 模板 (JSON)", value=json.dumps(step.config.body_template, ensure_ascii=False, indent=2), height=80, key=f"step_body_{i}_v{ver}", help="支持 {{step1.response.data.id}} 占位符引用上游数据")
+            body_str = st.text_area("Body 模板 (JSON)", value=json.dumps(step.config.body_template, ensure_ascii=False, indent=2), height=80, key=f"step_body_{i}_v{ver}", help="步骤间数据传递请在下方「字段定义」中用自然语言描述，无需手动写占位符")
             try:
                 step.config.body_template = json.loads(body_str)
             except json.JSONDecodeError:
                 pass  # 保留原始字符串，可能含未闭合的占位符
 
-        # 占位符提示
-        st.caption("占位符语法：`{{step1.response.data.id}}` = Step1 响应中的 `data.id` 字段。可用在 URL、Body、Headers 任意位置。")
+        # 步骤间数据依赖提示
+        st.caption('步骤间数据传递：在下方「② 字段定义」中用自然语言描述，如「Step2 使用 Step1 返回的 data.id」，AI 会自动生成数据链路。')
 
         # 操作按钮
         btn_col1, btn_col2, btn_col3, _ = st.columns([1, 1, 1, 7])
@@ -247,8 +247,6 @@ for i, step in enumerate(steps):
 if steps_to_delete:
     st.session_state.pipeline.steps = [s for i, s in enumerate(steps) if i not in steps_to_delete]
     st.rerun()
-
-# 移除重复的占位符提示
 
 # 添加步骤按钮
 if st.button("+ 添加步骤", use_container_width=True, type="secondary"):
@@ -275,7 +273,7 @@ if bindings:
         })
     st.dataframe(binding_rows, use_container_width=True, hide_index=True)
 elif len(steps) > 1:
-    st.info("尚未定义步骤间的数据依赖。在 Body/URL 中使用 `{{step1.response.data.id}}` 语法来建立数据链路。")
+    st.info("尚未定义步骤间的数据依赖。在下方「字段定义」中用自然语言描述后点击「生成测试数据」，AI 会自动建立数据链路。")
 
 
 # ==================== ② 字段定义 & 生成 ====================
@@ -283,21 +281,26 @@ elif len(steps) > 1:
 st.header("② 字段定义 & 测试数据生成")
 
 st.text_area(
-    "粘贴 Pipeline 字段定义（每步接口的字段约束、业务规则）",
+    "粘贴 Pipeline 字段定义（每步接口的字段约束、业务规则、数据依赖）",
     key="field_requirements",
     height=160,
-    placeholder="""描述整个 Pipeline 的数据流和各步接口的字段约束：
+    placeholder="""描述每个步骤的字段约束和步骤间的数据依赖（用自然语言即可，无需手写占位符）：
 
 Step 1（创建订单）：
 - name: string, 必填, 1-100位
 - quantity: int, 必填, 1-9999
 
 Step 2（查询订单）：
-- 用 Step1 返回的 data.id 拼接到 URL
+- 用 Step1 返回的 data.records[0].id 作为查询参数
 
 Step 3（更新订单状态）：
-- id: 来自 Step1
-- status: enum[shipped, delivered, cancelled]""",
+- id: 取 Step1 返回数据里 data.records[0].id
+- status: 固定为 shipped
+
+数据依赖写法示例（AI 自动识别并生成链路）：
+- 「取 Step1 返回的 data.id」
+- 「用 Step1 响应中 data.records[0].id 填入 URL」
+- 「获取 step1 返回数据里 data[0].id 或 data.records[0].id」""",
 )
 
 gen_col1, gen_col2, _ = st.columns([1.5, 1, 3])

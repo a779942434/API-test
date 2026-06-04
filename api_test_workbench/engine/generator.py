@@ -244,7 +244,7 @@ def generate_pipeline_test_cases(
                 post_condition=tc.get("post_condition", ""),
             )
 
-            # 将 data_dependencies 应用到对应步骤的配置中
+            # 将 data_dependencies 应用到对应步骤的配置中（合并而非覆盖）
             deps = tc.get("data_dependencies", {})
             if deps:
                 if step_idx < len(pipeline.steps):
@@ -253,12 +253,20 @@ def generate_pipeline_test_cases(
                         step.config.url = deps["url"]
                     if deps.get("body"):
                         try:
-                            step.config.body_template = json.loads(deps["body"]) if isinstance(deps["body"], str) else deps["body"]
+                            new_body = json.loads(deps["body"]) if isinstance(deps["body"], str) else deps["body"]
+                            if isinstance(step.config.body_template, dict) and isinstance(new_body, dict):
+                                step.config.body_template = {**step.config.body_template, **new_body}
+                            else:
+                                step.config.body_template = new_body
                         except (json.JSONDecodeError, TypeError):
                             step.config.body_template = deps["body"]
                     if deps.get("headers"):
                         try:
-                            step.config.headers = json.loads(deps["headers"]) if isinstance(deps["headers"], str) else deps["headers"]
+                            new_headers = json.loads(deps["headers"]) if isinstance(deps["headers"], str) else deps["headers"]
+                            if isinstance(step.config.headers, dict) and isinstance(new_headers, dict):
+                                step.config.headers = {**step.config.headers, **new_headers}
+                            else:
+                                step.config.headers = new_headers
                         except (json.JSONDecodeError, TypeError):
                             step.config.headers = deps["headers"]
 
