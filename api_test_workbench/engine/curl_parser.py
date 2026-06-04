@@ -67,6 +67,16 @@ def parse_curl(curl_str: str) -> dict:
                 raise ValueError(f"{t} 缺少 Body 参数")
             body = tokens[i]
 
+        elif t in ('-b', '--cookie'):
+            # Cookie 由底部登录 Session 管理，curl 中附带的旧 Cookie 忽略
+            i += 1
+            if i >= len(tokens):
+                raise ValueError(f"{t} 缺少 Cookie 参数")
+
+        elif t in ('-u', '--user'):
+            # Basic Auth 凭据，忽略
+            i += 1
+
         elif t.startswith('-X') and len(t) > 2:
             method = t[2:].upper()
 

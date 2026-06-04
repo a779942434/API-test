@@ -203,7 +203,11 @@ def _init_session_state():
     }
     for k, v in defaults.items():
         if k not in st.session_state:
-            st.session_state[k] = v
+            # field_requirements 优先从备份恢复，避免增删步骤时丢失
+            if k == "field_requirements":
+                st.session_state[k] = st.session_state.get("_field_requirements_backup", v)
+            else:
+                st.session_state[k] = v
 
     # 向后兼容：从旧版 session state 迁移
     if "api_url" in st.session_state and st.session_state.api_url:
@@ -254,6 +258,11 @@ def _render_pipeline_flow(steps: list) -> str:
         '<div style="display:flex;align-items:center;flex-wrap:wrap;padding:12px 0;'
         'overflow-x:auto;">' + "".join(boxes) + '</div>'
     )
+
+
+def _backup_fr():
+    """备份字段定义内容，防止增删步骤等 rerun 操作丢失用户填写的数据（空值也备份）"""
+    st.session_state["_field_requirements_backup"] = st.session_state.get("field_requirements", "")
 
 
 def _scan_all_bindings(pipeline: Pipeline) -> list[DataBinding]:
@@ -341,6 +350,10 @@ for i, step in enumerate(steps):
                     if parsed["headers"]:
                         merged = dict(step.config.headers)
                         merged.update(parsed["headers"])
+                        # 剔除 Cookie 头：认证由底部登录 Session 统一管理，curl 中的旧 Cookie 会覆盖登录态导致 401
+                        for h in list(merged.keys()):
+                            if h.lower() in ("cookie", "set-cookie"):
+                                del merged[h]
                         step.config.headers = merged
                     if parsed["body"] is not None:
                         try:
@@ -381,20 +394,37 @@ for i, step in enumerate(steps):
                 steps[i], steps[i-1] = steps[i-1], steps[i]
                 tcs = st.session_state.pipeline_test_cases_by_step
                 tcs[i], tcs[i-1] = tcs.get(i-1, []), tcs.get(i, [])
+                _backup_fr()
                 st.rerun()
         with btn_col2:
             if i < len(steps) - 1 and st.button("⬇ 下移", key=f"move_down_{i}"):
                 steps[i], steps[i+1] = steps[i+1], steps[i]
                 tcs = st.session_state.pipeline_test_cases_by_step
                 tcs[i], tcs[i+1] = tcs.get(i+1, []), tcs.get(i, [])
+                _backup_fr()
                 st.rerun()
         with btn_col3:
             if len(steps) > 1 and st.button("🗑 删除", key=f"delete_{i}"):
                 steps_to_delete.add(i)
 
-# 执行删除
+# 执行删除（保留剩余步骤的测试数据和认证状态）
 if steps_to_delete:
-    st.session_state.pipeline.steps = [s for i, s in enumerate(steps) if i not in steps_to_delete]
+    old_steps = steps  # 当前步骤列表
+    old_tcs = st.session_state.pipeline_test_cases_by_step
+    new_steps = []
+    new_tcs = {}
+    new_idx = 0
+    for old_idx, s in enumerate(old_steps):
+        if old_idx in steps_to_delete:
+            continue
+        new_steps.append(s)
+        if old_idx in old_tcs:
+            new_tcs[new_idx] = old_tcs[old_idx]
+        new_idx += 1
+    st.session_state.pipeline.steps = new_steps
+    st.session_state.pipeline_test_cases_by_step = new_tcs
+    # 注意：auth_session / auth_ok 不动，保持登录态
+    _backup_fr()
     st.rerun()
 
 # 添加步骤按钮
@@ -404,6 +434,7 @@ if st.button("+ 添加步骤", use_container_width=True, type="secondary"):
         name=f"Step {new_idx}",
         config=ApiConfig(method="GET", headers={"Content-Type": "application/json"}, body_template={}),
     ))
+    _backup_fr()
     st.rerun()
 
 st.markdown("---")
@@ -451,6 +482,9 @@ Step 3（更新订单状态）：
 - 「用 Step1 响应中 data.records[0].id 填入 URL」
 - 「获取 step1 返回数据里 data[0].id 或 data.records[0].id」""",
 )
+
+# 每次渲染后备份字段定义内容（含空值），防止增删步骤时丢失
+_backup_fr()
 
 gen_col1, gen_col2, _ = st.columns([1.5, 1, 3])
 with gen_col1:
