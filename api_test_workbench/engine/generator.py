@@ -13,9 +13,8 @@ from api_test_workbench.config.prompts import (
 )
 from api_test_workbench.engine.models import TestCase, Pipeline
 
-# API Key 通过环境变量或 ~/.claude/credentials.json 获取，不硬编码
+# API Key 通过环境变量或 ~/.claude/credentials.json / settings.json 获取
 _ANTHROPIC_API_KEY: Optional[str] = None
-_API_PROVIDER: Optional[str] = None  # "anthropic" | "deepseek"
 
 
 def _get_api_key() -> str:
@@ -36,8 +35,7 @@ def _get_api_key() -> str:
             if os.path.exists(path):
                 with open(path) as f:
                     data = json.load(f)
-                # settings.json 的 key 在 env 子对象下
-                if "settings" in path or path.endswith("settings.json"):
+                if path.endswith("settings.json"):
                     data = data.get("env", data)
                 for name in key_names:
                     if data.get(name):
@@ -55,10 +53,7 @@ def _get_api_key() -> str:
 
 
 def _detect_provider(api_key: str) -> str:
-    """根据 key 格式自动识别 API 提供商"""
-    if api_key.startswith("sk-ant"):
-        return "anthropic"
-    return "deepseek"
+    return "anthropic" if api_key.startswith("sk-ant") else "deepseek"
 
 
 def _clean_json_response(text: str) -> str:
@@ -70,13 +65,9 @@ def _clean_json_response(text: str) -> str:
 
 
 def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, model: str) -> str:
-    """调用 DeepSeek API（OpenAI 兼容格式）"""
     resp = requests.post(
         "https://api.deepseek.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": model,
             "messages": [
@@ -94,19 +85,16 @@ def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, model: st
 
 
 def _call_anthropic(api_key: str, system_prompt: str, user_prompt: str, model: str) -> str:
-    """调用 Anthropic API"""
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
-            model=model,
-            max_tokens=4096,
+            model=model, max_tokens=4096,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
         return response.content[0].text
     except ImportError:
-        # 降级为直接 HTTP 调用 Anthropic Messages API
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -115,8 +103,7 @@ def _call_anthropic(api_key: str, system_prompt: str, user_prompt: str, model: s
                 "Content-Type": "application/json",
             },
             json={
-                "model": model,
-                "max_tokens": 4096,
+                "model": model, "max_tokens": 4096,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_prompt}],
             },
@@ -124,8 +111,48 @@ def _call_anthropic(api_key: str, system_prompt: str, user_prompt: str, model: s
         )
         if resp.status_code != 200:
             raise RuntimeError(f"Anthropic API 返回 {resp.status_code}: {resp.text}")
-        data = resp.json()
-        return data["content"][0]["text"]
+        return resp.json()["content"][0]["text"]
+
+
+def _call_ai(api_key: str, system_prompt: str, user_prompt: str, model: str) -> str:
+    """统一的 AI 调用入口，自动选择 provider"""
+    provider = _detect_provider(api_key)
+    if provider == "deepseek":
+        return _call_deepseek(api_key, system_prompt, user_prompt, model)
+    return _call_anthropic(api_key, system_prompt, user_prompt, model)
+
+
+def _parse_json_with_retry(api_key: str, raw_text: str, model: str) -> dict:
+    """解析 AI 返回的 JSON，失败时自动重试修复"""
+    cleaned = _clean_json_response(raw_text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass  # 第一次解析失败，尝试修复
+
+    retry_prompt = f"以下内容不是合法 JSON，请修复并只输出 JSON：\n\n{cleaned}"
+    try:
+        raw = _call_ai(api_key, "你是一个 JSON 修复器。只输出 JSON，不要任何解释。", retry_prompt, model)
+        return json.loads(_clean_json_response(raw))
+    except (json.JSONDecodeError, Exception) as e:
+        raise RuntimeError(f"AI 返回了非法 JSON，且修复失败: {e}\n原始内容: {cleaned[:500]}")
+
+
+def _make_test_case(tc_data: dict) -> TestCase:
+    """从 AI 返回的字典构建 TestCase 对象"""
+    return TestCase(
+        case_id=tc_data.get("case_id", ""),
+        case_name=tc_data.get("case_name", ""),
+        operation=tc_data.get("operation", "create"),
+        category=tc_data.get("category", "positive"),
+        input_data=tc_data.get("input_data", {}),
+        expected_status_code=tc_data.get("expected_status_code", 200),
+        expected_response_keys=tc_data.get("expected_response_keys", []),
+        assertion_logic=tc_data.get("assertion_logic", ""),
+        pre_condition=tc_data.get("pre_condition", ""),
+        post_condition=tc_data.get("post_condition", ""),
+        data_dependencies=tc_data.get("data_dependencies", {}),
+    )
 
 
 def generate_test_cases(
@@ -137,47 +164,14 @@ def generate_test_cases(
     """根据字段定义调用 AI API 生成测试用例列表"""
     api_key = _get_api_key()
     provider = _detect_provider(api_key)
-
-    # 根据 provider 设置默认模型
     if not model:
         model = "claude-sonnet-4-20250514" if provider == "anthropic" else "deepseek-chat"
 
     user_prompt = build_user_prompt(field_requirements, api_url, method)
+    raw = _call_ai(api_key, SYSTEM_PROMPT, user_prompt, model)
+    data = _parse_json_with_retry(api_key, raw, model)
 
-    if provider == "deepseek":
-        raw = _call_deepseek(api_key, SYSTEM_PROMPT, user_prompt, model)
-    else:
-        raw = _call_anthropic(api_key, SYSTEM_PROMPT, user_prompt, model)
-
-    cleaned = _clean_json_response(raw)
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        # 重试一次修复 JSON
-        retry_prompt = f"以下内容不是合法 JSON，请修复并只输出 JSON：\n\n{cleaned}"
-        if provider == "deepseek":
-            raw = _call_deepseek(api_key, "你是一个 JSON 修复器。只输出 JSON，不要任何解释。", retry_prompt, model)
-        else:
-            raw = _call_anthropic(api_key, "你是一个 JSON 修复器。只输出 JSON，不要任何解释。", retry_prompt, model)
-        data = json.loads(_clean_json_response(raw))
-
-    test_cases = []
-    for tc in data.get("test_cases", []):
-        test_cases.append(TestCase(
-            case_id=tc.get("case_id", ""),
-            case_name=tc.get("case_name", ""),
-            operation=tc.get("operation", "create"),
-            category=tc.get("category", "positive"),
-            input_data=tc.get("input_data", {}),
-            expected_status_code=tc.get("expected_status_code", 200),
-            expected_response_keys=tc.get("expected_response_keys", []),
-            assertion_logic=tc.get("assertion_logic", ""),
-            pre_condition=tc.get("pre_condition", ""),
-            post_condition=tc.get("post_condition", ""),
-        ))
-
-    return test_cases
+    return [_make_test_case(tc) for tc in data.get("test_cases", [])]
 
 
 def generate_pipeline_test_cases(
@@ -188,97 +182,32 @@ def generate_pipeline_test_cases(
 ) -> dict:
     """根据 Pipeline 描述调用 AI API 生成按步骤组织的测试用例。
 
-    Args:
-        pipeline_description: 用户输入的 Pipeline 描述文本
-        pipeline: Pipeline 定义
-        model: AI 模型名称（空则自动选择）
-        test_cases_per_step: 每步生成的测试用例数（默认 1，即只生成核心链路）
-
-    Returns:
-        dict[int, list[TestCase]]: {step_index: [TestCase, ...]}
+    data_dependencies 存入 TestCase 对象，不再修改 pipeline 原始配置，
+    由 runner 在执行时动态应用。
     """
     api_key = _get_api_key()
     provider = _detect_provider(api_key)
-
     if not model:
         model = "claude-sonnet-4-20250514" if provider == "anthropic" else "deepseek-chat"
 
-    # 构建步骤描述列表
-    step_descriptions = []
-    for i, step in enumerate(pipeline.steps):
-        desc = f"{step.name} — {step.config.method} {step.config.url}"
-        step_descriptions.append(desc)
+    step_descriptions = [
+        f"{s.name} — {s.config.method} {s.config.url}"
+        for s in pipeline.steps
+    ]
 
     user_prompt = build_pipeline_user_prompt(
         pipeline_description, step_descriptions, pipeline.steps,
         test_cases_per_step=test_cases_per_step,
     )
 
-    if provider == "deepseek":
-        raw = _call_deepseek(api_key, PIPELINE_SYSTEM_PROMPT, user_prompt, model)
-    else:
-        raw = _call_anthropic(api_key, PIPELINE_SYSTEM_PROMPT, user_prompt, model)
-
-    cleaned = _clean_json_response(raw)
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        retry_prompt = f"以下内容不是合法 JSON，请修复并只输出 JSON：\n\n{cleaned}"
-        if provider == "deepseek":
-            raw = _call_deepseek(api_key, "你是一个 JSON 修复器。只输出 JSON，不要任何解释。", retry_prompt, model)
-        else:
-            raw = _call_anthropic(api_key, "你是一个 JSON 修复器。只输出 JSON，不要任何解释。", retry_prompt, model)
-        data = json.loads(_clean_json_response(raw))
+    raw = _call_ai(api_key, PIPELINE_SYSTEM_PROMPT, user_prompt, model)
+    data = _parse_json_with_retry(api_key, raw, model)
 
     test_cases_by_step = {}
-
     for step_data in data.get("steps", []):
         step_idx = step_data.get("step_index", 0)
-        test_cases = []
-
-        for tc in step_data.get("test_cases", []):
-            test_case = TestCase(
-                case_id=tc.get("case_id", ""),
-                case_name=tc.get("case_name", ""),
-                operation=tc.get("operation", "create"),
-                category=tc.get("category", "positive"),
-                input_data=tc.get("input_data", {}),
-                expected_status_code=tc.get("expected_status_code", 200),
-                expected_response_keys=tc.get("expected_response_keys", []),
-                assertion_logic=tc.get("assertion_logic", ""),
-                pre_condition=tc.get("pre_condition", ""),
-                post_condition=tc.get("post_condition", ""),
-            )
-
-            # 将 data_dependencies 应用到对应步骤的配置中（合并而非覆盖）
-            deps = tc.get("data_dependencies", {})
-            if deps:
-                if step_idx < len(pipeline.steps):
-                    step = pipeline.steps[step_idx]
-                    if deps.get("url"):
-                        step.config.url = deps["url"]
-                    if deps.get("body"):
-                        try:
-                            new_body = json.loads(deps["body"]) if isinstance(deps["body"], str) else deps["body"]
-                            if isinstance(step.config.body_template, dict) and isinstance(new_body, dict):
-                                step.config.body_template = {**step.config.body_template, **new_body}
-                            else:
-                                step.config.body_template = new_body
-                        except (json.JSONDecodeError, TypeError):
-                            step.config.body_template = deps["body"]
-                    if deps.get("headers"):
-                        try:
-                            new_headers = json.loads(deps["headers"]) if isinstance(deps["headers"], str) else deps["headers"]
-                            if isinstance(step.config.headers, dict) and isinstance(new_headers, dict):
-                                step.config.headers = {**step.config.headers, **new_headers}
-                            else:
-                                step.config.headers = new_headers
-                        except (json.JSONDecodeError, TypeError):
-                            step.config.headers = deps["headers"]
-
-            test_cases.append(test_case)
-
-        test_cases_by_step[step_idx] = test_cases
+        test_cases_by_step[step_idx] = [
+            _make_test_case(tc) for tc in step_data.get("test_cases", [])
+        ]
 
     return test_cases_by_step

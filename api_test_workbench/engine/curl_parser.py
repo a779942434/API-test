@@ -27,7 +27,7 @@ def parse_curl(curl_str: str) -> dict:
         raise ValueError("命令必须以 'curl' 开头，例如：curl -X POST https://...")
 
     # ── 去掉 'curl' 及之前的内容（如路径 /usr/bin/curl） ──
-    s = re.sub(r'^.*(?<!/)\bcurl\b\s*', '', s, count=1)
+    s = re.sub(r'^.*\bcurl\b\s*', '', s, count=1)
 
     # ── 词法分析 ──
     try:

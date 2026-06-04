@@ -9,7 +9,6 @@ from pathlib import Path
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL 1.1.1+")
 
 import streamlit as st
-import requests as req
 
 # 确保项目根目录在 path 中
 _project_root = Path(__file__).resolve().parent.parent
@@ -181,7 +180,7 @@ st.title("API 测试工作台 — Pipeline")
 
 def _create_default_step() -> ApiStep:
     return ApiStep(
-        name="Step 1",
+        name="",
         config=ApiConfig(
             url="",
             method="POST",
@@ -196,7 +195,7 @@ def _init_session_state():
         "pipeline_test_cases_by_step": {},    # dict[int, list[TestCase]]
         "pipeline_results": None,              # Optional[PipelineResult]
         "auth_url": "http://bird.ob.shuyilink.com/auth/auth-login",
-        "auth_body": '{"username": "admin", "password": "sygl123456"}',
+        "auth_body": '{"username": "", "password": ""}',
         "auth_session": None,
         "auth_ok": False,
         "field_requirements": "",
@@ -382,7 +381,7 @@ for i, step in enumerate(steps):
             try:
                 step.config.body_template = json.loads(body_str)
             except json.JSONDecodeError:
-                pass  # 保留原始字符串，可能含未闭合的占位符
+                st.warning("Body JSON 格式错误，修改未保存")
 
         # 步骤间数据依赖提示
         st.caption('步骤间数据传递：在下方「② 字段定义」中用自然语言描述，如「Step2 使用 Step1 返回的 data.id」，AI 会自动生成数据链路。')
@@ -394,6 +393,9 @@ for i, step in enumerate(steps):
                 steps[i], steps[i-1] = steps[i-1], steps[i]
                 tcs = st.session_state.pipeline_test_cases_by_step
                 tcs[i], tcs[i-1] = tcs.get(i-1, []), tcs.get(i, [])
+                # 递增双方版本号 → Widget 全部用新 key 从 step.config 重新初始化
+                st.session_state[f"step_widget_ver_{i}"] = st.session_state.get(f"step_widget_ver_{i}", 0) + 1
+                st.session_state[f"step_widget_ver_{i-1}"] = st.session_state.get(f"step_widget_ver_{i-1}", 0) + 1
                 _backup_fr()
                 st.rerun()
         with btn_col2:
@@ -401,6 +403,8 @@ for i, step in enumerate(steps):
                 steps[i], steps[i+1] = steps[i+1], steps[i]
                 tcs = st.session_state.pipeline_test_cases_by_step
                 tcs[i], tcs[i+1] = tcs.get(i+1, []), tcs.get(i, [])
+                st.session_state[f"step_widget_ver_{i}"] = st.session_state.get(f"step_widget_ver_{i}", 0) + 1
+                st.session_state[f"step_widget_ver_{i+1}"] = st.session_state.get(f"step_widget_ver_{i+1}", 0) + 1
                 _backup_fr()
                 st.rerun()
         with btn_col3:
@@ -413,6 +417,7 @@ if steps_to_delete:
     old_tcs = st.session_state.pipeline_test_cases_by_step
     new_steps = []
     new_tcs = {}
+    new_vers = {}
     new_idx = 0
     for old_idx, s in enumerate(old_steps):
         if old_idx in steps_to_delete:
@@ -420,18 +425,24 @@ if steps_to_delete:
         new_steps.append(s)
         if old_idx in old_tcs:
             new_tcs[new_idx] = old_tcs[old_idx]
+        new_vers[new_idx] = st.session_state.get(f"step_widget_ver_{old_idx}", 0)
         new_idx += 1
     st.session_state.pipeline.steps = new_steps
     st.session_state.pipeline_test_cases_by_step = new_tcs
-    # 注意：auth_session / auth_ok 不动，保持登录态
+    # 重排 widget 版本号，对齐新索引
+    for ni in new_vers:
+        st.session_state[f"step_widget_ver_{ni}"] = new_vers[ni]
+    # 清理多余版本号
+    for oi in range(len(old_steps)):
+        if f"step_widget_ver_{oi}" in st.session_state and oi not in new_vers:
+            del st.session_state[f"step_widget_ver_{oi}"]
     _backup_fr()
     st.rerun()
 
 # 添加步骤按钮
 if st.button("+ 添加步骤", use_container_width=True, type="secondary"):
-    new_idx = len(st.session_state.pipeline.steps) + 1
     st.session_state.pipeline.steps.append(ApiStep(
-        name=f"Step {new_idx}",
+        name="",
         config=ApiConfig(method="GET", headers={"Content-Type": "application/json"}, body_template={}),
     ))
     _backup_fr()
@@ -633,7 +644,7 @@ if run_clicked:
         status_text = st.empty()
 
         def update_progress(current, total, result):
-            progress_bar.progress(current / total, f"执行 Step {current+1}/{total}")
+            progress_bar.progress((current + 1) / total, f"执行 Step {current+1}/{total}")
             icon = "✓" if result.passed else "✗"
             if result.skipped:
                 icon = "⏭"

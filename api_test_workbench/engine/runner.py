@@ -24,6 +24,13 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response) -> tuple
     if not assertion_logic:
         return True, ""
 
+    # 安全检查：拒绝包含潜在沙箱逃逸特征的断言
+    dangerous = ("__", "import", "exec", "compile", "open", "getattr", "setattr", "delattr")
+    lower = assertion_logic.lower()
+    for pat in dangerous:
+        if pat in lower:
+            return False, f"断言包含不安全字符: {pat}"
+
     try:
         resp_json = resp.json() if resp.text else {}
     except (json.JSONDecodeError, ValueError):
@@ -80,12 +87,8 @@ def run_single_test(
     try:
         if method == "GET":
             resp = session.get(url, headers=api_config.headers, params=request_body)
-        elif method == "POST":
-            resp = session.post(url, headers=api_config.headers, json=request_body)
-        elif method == "PUT":
-            resp = session.put(url, headers=api_config.headers, json=request_body)
-        elif method == "DELETE":
-            resp = session.delete(url, headers=api_config.headers, json=request_body)
+        elif method in ("POST", "PUT", "DELETE", "PATCH"):
+            resp = session.request(method, url, headers=api_config.headers, json=request_body)
         else:
             return TestResult(
                 case_id=tc.case_id,
@@ -161,8 +164,8 @@ def get_auth_session(auth_endpoint: str, auth_body: dict) -> requests.Session:
     session = requests.Session()
     session.headers.update({"Content-Type": "application/json"})
 
-    resp = session.post(auth_endpoint, json=auth_body, allow_redirects=False)
-    if resp.status_code != 200:
+    resp = session.post(auth_endpoint, json=auth_body)
+    if resp.status_code not in (200, 302):
         raise RuntimeError(f"登录失败 status={resp.status_code}: {resp.text}")
 
     result = resp.json()
@@ -232,9 +235,32 @@ def execute_pipeline(
         try:
             resolved_config = resolve_step_config(step, context)
 
-            # 解析每个测试用例 input_data 中的占位符
+            # 解析每个测试用例，应用 data_dependencies 到配置副本
             resolved_tcs = []
             for tc in step_tcs:
+                # 为该用例应用 data_dependencies（URL/Body/Headers 注入占位符）
+                tc_config = resolved_config
+                deps = getattr(tc, 'data_dependencies', {}) or {}
+                if deps:
+                    tc_config = ApiConfig(
+                        name=resolved_config.name,
+                        url=deps.get("url", resolved_config.url),
+                        method=resolved_config.method,
+                        headers=({**resolved_config.headers, **(
+                            json.loads(deps["headers"]) if isinstance(deps.get("headers"), str) else deps["headers"]
+                        )} if deps.get("headers") else resolved_config.headers),
+                        body_template=(
+                            {**resolved_config.body_template, **(
+                                json.loads(deps["body"]) if isinstance(deps.get("body"), str) else deps["body"]
+                            )} if deps.get("body") and isinstance(resolved_config.body_template, dict) else
+                            resolved_config.body_template
+                        ),
+                    )
+                    # 解析 deps 中可能含有的占位符
+                    tc_config = resolve_step_config(
+                        ApiStep(name=tc.case_name, config=tc_config), context
+                    )
+
                 resolved_input = resolve_placeholders(tc.input_data, context)
                 resolved_tc = TestCase(
                     case_id=tc.case_id,
@@ -248,17 +274,24 @@ def execute_pipeline(
                     pre_condition=tc.pre_condition,
                     post_condition=tc.post_condition,
                 )
-                resolved_tcs.append(resolved_tc)
+                resolved_tcs.append((resolved_tc, tc_config))
 
-            results = run_all_tests(resolved_tcs, resolved_config, session)
+            results = []
+            for resolved_tc, tc_config in resolved_tcs:
+                results.append(run_single_test(resolved_tc, tc_config, session))
             passed = all(r.passed for r in results)
 
-            # 从第一个通过的用例中提取响应数据
+            # 从通过的用例中提取响应数据（优先选含 dict 响应的）
             extracted = {}
             for r in results:
-                if r.passed and isinstance(r.response_body, dict):
-                    extracted = _flatten_response(r.response_body)
-                    break
+                if r.passed:
+                    if isinstance(r.response_body, dict):
+                        extracted = _flatten_response(r.response_body)
+                        break
+                    # 记录非 dict 响应但继续找更好的
+                    elif not extracted:
+                        extracted = {"response.raw": str(r.response_body)[:200]}
+            # 如果没有通过的用例或全部非 dict 且无内容，extracted 保持 {}
 
             context.extracted_values[step_idx] = extracted
             sr = StepResult(

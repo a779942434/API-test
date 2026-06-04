@@ -29,6 +29,7 @@ class TestCase:
     assertion_logic: str = ""
     pre_condition: str = ""
     post_condition: str = ""
+    data_dependencies: dict = field(default_factory=dict)  # {url, body, headers} 运行时注入，不修改用户配置
 
 
 @dataclass
@@ -71,10 +72,6 @@ class Pipeline:
     """完整 Pipeline 定义"""
     name: str = "Pipeline"
     steps: list = field(default_factory=list)   # list[ApiStep]
-
-    @property
-    def is_single_api(self) -> bool:
-        return len(self.steps) <= 1
 
 
 @dataclass
