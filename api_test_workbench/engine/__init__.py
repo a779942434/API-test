@@ -13,3 +13,4 @@ from api_test_workbench.engine.bindings import (
 from api_test_workbench.engine.generator import (
     generate_test_cases, generate_pipeline_test_cases,
 )
+from api_test_workbench.engine.curl_parser import parse_curl

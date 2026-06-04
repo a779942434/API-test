@@ -2,7 +2,11 @@
 
 import json
 import sys
+import warnings
 from pathlib import Path
+
+# macOS LibreSSL 与 urllib3 v2 兼容性警告，不影响功能
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL 1.1.1+")
 
 import streamlit as st
 import requests as req
@@ -19,6 +23,7 @@ from api_test_workbench.engine.runner import (
     run_all_tests, get_auth_session, execute_pipeline,
 )
 from api_test_workbench.engine.bindings import scan_placeholders
+from api_test_workbench.engine.curl_parser import parse_curl
 
 st.set_page_config(page_title="API 测试工作台 — Pipeline", layout="wide")
 st.title("API 测试工作台 — Pipeline")
@@ -143,26 +148,75 @@ st.subheader(f"步骤列表 ({len(steps)})")
 steps_to_delete = set()
 
 for i, step in enumerate(steps):
+    # widget 版本号：解析 curl 后递增，强制 widget 用新 value= 重新初始化
+    ver_key = f"step_widget_ver_{i}"
+    if ver_key not in st.session_state:
+        st.session_state[ver_key] = 0
+    ver = st.session_state[ver_key]
+
     with st.expander(f"Step {i+1}：{step.name or '(未命名)'}  — {step.config.method} {step.config.url or '(未设置URL)'}", expanded=(i == 0)):
         col_name, col_method, col_failure = st.columns([3, 1, 1.5])
         with col_name:
             step.name = st.text_input(f"步骤名称", value=step.name, key=f"step_name_{i}", placeholder="如：创建订单")
         with col_method:
-            step.config.method = st.selectbox("Method", ["POST", "GET", "PUT", "DELETE"], key=f"step_method_{i}", index=["POST", "GET", "PUT", "DELETE"].index(step.config.method) if step.config.method in ["POST", "GET", "PUT", "DELETE"] else 0)
+            step.config.method = st.selectbox("Method", ["POST", "GET", "PUT", "DELETE"], key=f"step_method_{i}_v{ver}", index=["POST", "GET", "PUT", "DELETE"].index(step.config.method) if step.config.method in ["POST", "GET", "PUT", "DELETE"] else 0)
         with col_failure:
             step.on_failure = st.selectbox("失败策略", ["stop", "continue"], key=f"step_failure_{i}", index=0 if step.on_failure == "stop" else 1, help="stop=停止后续步骤, continue=忽略错误继续执行")
 
-        step.config.url = st.text_input("接口地址", value=step.config.url, key=f"step_url_{i}", placeholder="http://bird.ob.shuyilink.com/linkim-pc/admin-console/tooling/sparePartDevice")
+        step.config.url = st.text_input("接口地址", value=step.config.url, key=f"step_url_{i}_v{ver}", placeholder="http://bird.ob.shuyilink.com/linkim-pc/admin-console/tooling/sparePartDevice")
+
+        # ── curl 命令粘贴解析 ──
+        curl_col1, curl_col2 = st.columns([4, 1])
+        with curl_col1:
+            curl_input = st.text_area(
+                "粘贴 curl 命令（可选，点击「解析」自动填充上方字段）",
+                key=f"step_curl_{i}",
+                height=80,
+                placeholder="curl -X POST 'http://example.com/api' -H 'Content-Type: application/json' -d '{\"key\": \"value\"}'",
+            )
+        with curl_col2:
+            st.write("")
+            st.write("")
+            parse_clicked = st.button("解析", key=f"curl_parse_btn_{i}", use_container_width=True)
+
+        if parse_clicked:
+            raw = curl_input.strip()
+            if not raw:
+                st.warning("请先粘贴 curl 命令")
+            else:
+                try:
+                    parsed = parse_curl(raw)
+                    step.config.method = parsed["method"]
+                    if parsed["url"]:
+                        step.config.url = parsed["url"]
+                    if parsed["headers"]:
+                        merged = dict(step.config.headers)
+                        merged.update(parsed["headers"])
+                        step.config.headers = merged
+                    if parsed["body"] is not None:
+                        try:
+                            step.config.body_template = json.loads(parsed["body"])
+                        except (json.JSONDecodeError, TypeError):
+                            step.config.body_template = {"raw_body": parsed["body"]}
+                    # 递增 widget 版本号，rerun 后所有 widget 用新 key 重新初始化
+                    st.session_state[ver_key] = ver + 1
+                    shortened = parsed['url'][:60] + ('...' if len(parsed['url']) > 60 else '')
+                    st.success(f"已解析：{parsed['method']} {shortened}")
+                    st.rerun()
+                except ValueError as e:
+                    st.warning(f"解析失败：{e}")
+                except Exception as e:
+                    st.warning(f"解析异常：{e}")
 
         col_h, col_b = st.columns(2)
         with col_h:
-            headers_str = st.text_area("Headers (JSON)", value=json.dumps(step.config.headers, ensure_ascii=False, indent=2), height=80, key=f"step_headers_{i}")
+            headers_str = st.text_area("Headers (JSON)", value=json.dumps(step.config.headers, ensure_ascii=False, indent=2), height=80, key=f"step_headers_{i}_v{ver}")
             try:
                 step.config.headers = json.loads(headers_str)
             except json.JSONDecodeError:
                 st.warning("Headers JSON 格式错误")
         with col_b:
-            body_str = st.text_area("Body 模板 (JSON)", value=json.dumps(step.config.body_template, ensure_ascii=False, indent=2), height=80, key=f"step_body_{i}", help="支持 {{step1.response.data.id}} 占位符引用上游数据")
+            body_str = st.text_area("Body 模板 (JSON)", value=json.dumps(step.config.body_template, ensure_ascii=False, indent=2), height=80, key=f"step_body_{i}_v{ver}", help="支持 {{step1.response.data.id}} 占位符引用上游数据")
             try:
                 step.config.body_template = json.loads(body_str)
             except json.JSONDecodeError:
