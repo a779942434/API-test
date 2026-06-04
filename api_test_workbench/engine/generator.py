@@ -13,8 +13,8 @@ from api_test_workbench.config.prompts import (
 )
 from api_test_workbench.engine.models import TestCase, Pipeline
 
-# Anthropic SDK 可选安装，优先使用直接 HTTP 调用（兼容 DeepSeek）
-_ANTHROPIC_API_KEY: Optional[str] = "sk-2b3d7a1bcbc3450585ac0ac28dd008dd"
+# API Key 通过环境变量或 ~/.claude/credentials.json 获取，不硬编码
+_ANTHROPIC_API_KEY: Optional[str] = None
 _API_PROVIDER: Optional[str] = None  # "anthropic" | "deepseek"
 
 
