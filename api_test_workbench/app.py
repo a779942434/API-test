@@ -225,12 +225,15 @@ if st.session_state.get("_show_load_ui"):
                     st.session_state.auth_url = data["auth_url"]
                     st.session_state.auth_body = data["auth_body"]
                     st.session_state.pipeline_results = None
-                    # 清除所有步骤相关 widget 键，强制从加载数据重新初始化
+                    # 递增所有步骤 widget 版本号 → 强制用新 key 从加载数据重新初始化
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("step_widget_ver_"):
+                            st.session_state[k] += 1
+                    # 同时清除旧 widget 数据键
                     for k in list(st.session_state.keys()):
                         if any(k.startswith(p) for p in (
-                            "step_widget_ver_", "step_url_", "step_method_",
-                            "step_headers_", "step_body_", "step_name_",
-                            "step_curl_", "step_ignored_",
+                            "step_url_", "step_method_", "step_headers_",
+                            "step_body_", "step_name_", "step_curl_", "step_ignored_",
                         )):
                             del st.session_state[k]
                     st.session_state["_show_load_ui"] = False
@@ -260,11 +263,13 @@ def _create_default_step() -> ApiStep:
         ),
     )
 
+
+
 def _init_session_state():
     defaults = {
         "pipeline": Pipeline(name="我的测试链路", steps=[_create_default_step()]),
-        "pipeline_test_cases_by_step": {},    # dict[int, list[TestCase]]
-        "pipeline_results": None,              # Optional[PipelineResult]
+        "pipeline_test_cases_by_step": {},
+        "pipeline_results": None,
         "auth_url": "http://bird.ob.shuyilink.com/auth/auth-login",
         "auth_body": '{"username": "", "password": ""}',
         "auth_session": None,
@@ -273,31 +278,17 @@ def _init_session_state():
     }
     for k, v in defaults.items():
         if k not in st.session_state:
-            # field_requirements 优先从备份恢复，避免增删步骤时丢失
             if k == "field_requirements":
                 st.session_state[k] = st.session_state.get("_field_requirements_backup", v)
             else:
                 st.session_state[k] = v
 
-    # 向后兼容：从旧版 session state 迁移
-    if "api_url" in st.session_state and st.session_state.api_url:
-        st.session_state.pipeline.steps[0].config.url = st.session_state.api_url
-        st.session_state.pipeline.steps[0].config.method = st.session_state.get("api_method", "POST")
-        try:
-            st.session_state.pipeline.steps[0].config.headers = json.loads(
-                st.session_state.get("api_headers", '{"Content-Type": "application/json"}')
-            )
-        except json.JSONDecodeError:
-            pass
-        try:
-            st.session_state.pipeline.steps[0].config.body_template = json.loads(
-                st.session_state.get("api_body_template", "{}")
-            )
-        except json.JSONDecodeError:
-            pass
-
-_init_session_state()
-
+    # 向后兼容：从旧版 session state 迁移（仅执行一次）
+    if "api_url" in st.session_state and st.session_state.api_url and not st.session_state.get("_backward_compat_done"):
+        if not st.session_state.pipeline.steps[0].config.url:
+            st.session_state.pipeline.steps[0].config.url = st.session_state.api_url
+            st.session_state.pipeline.steps[0].config.method = st.session_state.get("api_method", "POST")
+        st.session_state["_backward_compat_done"] = True
 
 # ==================== 辅助函数 ====================
 
@@ -367,9 +358,10 @@ def _scan_all_bindings(pipeline: Pipeline) -> list[DataBinding]:
 
 # ==================== ① Pipeline 配置 ====================
 
+_init_session_state()
+
 st.header("🔗 ① Pipeline 配置")
 
-# Pipeline 名称
 pipeline_name = st.text_input("链路名称", value=st.session_state.pipeline.name, key="pipeline_name_input")
 st.session_state.pipeline.name = pipeline_name
 
@@ -406,7 +398,6 @@ for i, step in enumerate(steps):
             step.ignored = st.checkbox("忽略", value=step.ignored, key=f"step_ignored_{i}", help="跳过此步骤，数据仍向下传递")
 
         step.config.url = st.text_input("接口地址", value=step.config.url, key=f"step_url_{i}_v{ver}", placeholder="http://bird.ob.shuyilink.com/linkim-pc/admin-console/tooling/sparePartDevice")
-
         # ── curl 命令粘贴解析 ──
         curl_col1, curl_col2 = st.columns([4, 1])
         with curl_col1:
@@ -767,74 +758,48 @@ if pipeline_results:
     if pipeline_results.stopped_at_step >= 0:
         st.warning(f"Pipeline 在 Step {pipeline_results.stopped_at_step + 1} 处中断")
 
-    # 按步骤 Tab 展示
-    step_tab_labels = []
-    for sr in sr_list:
-        passed_count = sum(1 for r in sr.test_results if r.passed) if sr.test_results else 0
-        total_count = len(sr.test_results)
-        icon = "⏭" if sr.skipped else ("✓" if sr.passed else "✗")
-        step_tab_labels.append(f"{icon} {sr.step_name} ({passed_count}/{total_count})")
+    view_mode = st.radio("查看方式", ["📋 按步骤", "🔗 按链路"], horizontal=True)
 
-    result_tabs = st.tabs(step_tab_labels)
+    if view_mode == "📋 按步骤":
+        step_tab_labels = []
+        for sr in sr_list:
+            passed_count = sum(1 for r in sr.test_results if r.passed) if sr.test_results else 0
+            total_count = len(sr.test_results)
+            icon = "⏭" if sr.skipped else ("✓" if sr.passed else "✗")
+            step_tab_labels.append(f"{icon} {sr.step_name} ({passed_count}/{total_count})")
+        result_tabs = st.tabs(step_tab_labels)
+        for i, (sr, tab) in enumerate(zip(sr_list, result_tabs)):
+            with tab:
+                _render_step_result(sr)
+    else:
+        max_cases = max((len(sr.test_results) for sr in sr_list), default=0)
+        chain_tabs = st.tabs([f"链路 {j+1}" for j in range(max_cases)])
+        for j, tab in enumerate(chain_tabs):
+            with tab:
+                chain_passed = sum(1 for sr in sr_list if j < len(sr.test_results) and sr.test_results[j].passed)
+                chain_total = sum(1 for sr in sr_list if j < len(sr.test_results))
+                chain_icon = "✓" if chain_passed == chain_total else "✗"
+                st.caption(f"{chain_icon} 链路 {j+1}: {chain_passed}/{chain_total} 通过")
+                for i, sr in enumerate(sr_list):
+                    if j < len(sr.test_results):
+                        r = sr.test_results[j]
+                        icon = "✓" if r.passed else "✗"
+                        with st.expander(f"{icon} Step{i+1} {sr.step_name} — {r.case_name}", expanded=not r.passed):
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.markdown(f"**请求 URL:** `{r.request_url}`")
+                                st.markdown("**请求体:**")
+                                st.json(r.request_body)
+                            with c2:
+                                st.markdown(f"**状态码:** {r.actual_status_code} (期望 {r.expected_status_code})")
+                                if r.error_message:
+                                    st.error(f"**错误:** {r.error_message}")
+                                st.markdown("**响应体:**")
+                                if isinstance(r.response_body, dict):
+                                    st.json(r.response_body)
+                                else:
+                                    st.text(str(r.response_body)[:2000])
 
-    for i, (sr, tab) in enumerate(zip(sr_list, result_tabs)):
-        with tab:
-            if sr.skipped:
-                st.info(f"此步骤被跳过：{sr.error_message}")
-                continue
-
-            if sr.error_message:
-                st.error(sr.error_message)
-
-            # 提取的数据摘要
-            if sr.extracted_data:
-                with st.expander("提取的数据（传给下游）", expanded=False):
-                    st.json(sr.extracted_data)
-
-            # 测试用例结果
-            for j, result in enumerate(sr.test_results):
-                icon = "✓" if result.passed else "✗"
-                with st.expander(f"{icon} {result.case_name} — status={result.actual_status_code} (期望 {result.expected_status_code})", expanded=not result.passed):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown(f"**请求 URL:** `{result.request_url}`")
-                        st.markdown("**请求体:**")
-                        st.json(result.request_body)
-                    with c2:
-                        st.markdown(f"**状态码:** {result.actual_status_code} (期望 {result.expected_status_code})")
-                        if result.error_message:
-                            st.error(f"**错误:** {result.error_message}")
-                        st.markdown("**响应体:**")
-                        if isinstance(result.response_body, dict):
-                            st.json(result.response_body)
-                        else:
-                            st.text(str(result.response_body)[:2000])
-
-def _init_session_state():
-    defaults = {
-        "pipeline": Pipeline(name="我的测试链路", steps=[_create_default_step()]),
-        "pipeline_test_cases_by_step": {},
-        "pipeline_results": None,
-        "auth_url": "http://bird.ob.shuyilink.com/auth/auth-login",
-        "auth_body": '{"username": "", "password": ""}',
-        "auth_session": None,
-        "auth_ok": False,
-        "field_requirements": "",
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            if k == "field_requirements":
-                st.session_state[k] = st.session_state.get("_field_requirements_backup", v)
-            else:
-                st.session_state[k] = v
-
-    # 向后兼容：从旧版 session state 迁移（仅执行一次）
-    if "api_url" in st.session_state and st.session_state.api_url and not st.session_state.get("_backward_compat_done"):
-        if not st.session_state.pipeline.steps[0].config.url:
-            st.session_state.pipeline.steps[0].config.url = st.session_state.api_url
-            st.session_state.pipeline.steps[0].config.method = st.session_state.get("api_method", "POST")
-        st.session_state["_backward_compat_done"] = True
-_init_session_state()
 
 
 # ==================== 辅助函数 ====================
