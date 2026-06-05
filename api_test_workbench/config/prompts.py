@@ -30,6 +30,9 @@ API 响应约定：
 - 业务成功：resp.json()['code'] == '0'
 - 业务失败：resp.json()['code'] != '0'
 - expected_status_code 一律填 200，assertion_logic 用 code 判断业务成败
+- 注意：API 返回的数字字段可能是字符串类型（如 total: "5"），数值比较时需用 int() 转换：
+  正确: int(resp_json['data']['total']) > 0
+  错误: resp_json['data']['total'] > 0
 
 生成规则：
 1. 覆盖完整 CRUD + 列表查询（含分页、过滤、排序、模糊搜索）

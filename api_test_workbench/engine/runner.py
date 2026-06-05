@@ -255,6 +255,14 @@ def execute_pipeline(
         case_stopped = False
 
         for step_idx, step in enumerate(pipeline.steps):
+            # 忽略的步骤：跳过执行但保留数据传递
+            if step.ignored:
+                step_results_map[step_idx].append(TestResult(
+                    case_id="", case_name=f"(已忽略)", passed=True,
+                    actual_status_code=0, expected_status_code=0, response_body=None,
+                ))
+                continue
+
             step_tcs = test_cases_by_step.get(step_idx, [])
             if not step_tcs:
                 continue

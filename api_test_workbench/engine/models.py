@@ -65,6 +65,8 @@ class ApiStep:
     name: str = ""                              # 步骤名，如 "创建订单"
     config: ApiConfig = field(default_factory=ApiConfig)
     on_failure: str = "stop"                    # "stop" | "continue"
+    ignored: bool = False                       # 跳过此步骤
+    ignored: bool = False                       # 跳过此步骤
 
 
 @dataclass

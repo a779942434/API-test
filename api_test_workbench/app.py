@@ -174,7 +174,78 @@ code { background: #1E293B !important; color: #93C5FD !important; padding: 2px 6
 </style>
 """, unsafe_allow_html=True)
 
-st.title("API 测试工作台 — Pipeline")
+# ── 标题 + 存档按钮 ──
+col_title, col_save, col_load = st.columns([3, 0.7, 0.7])
+with col_title:
+    st.title("API 测试工作台 — Pipeline")
+with col_save:
+    st.write("")
+    if st.button("💾 保存", width='stretch', help="保存当前全部状态到本地"):
+        from api_test_workbench.engine.session_store import save as session_save, SAVE_DIR
+        try:
+            p = st.session_state.pipeline
+            # 汇总当前步骤信息供确认
+            step_info = "、".join(f"Step{i+1}:{s.config.method} {s.config.url[:40] if s.config.url else '(空)'}"
+                                 for i, s in enumerate(p.steps))
+            path = session_save(
+                p,
+                st.session_state.get("field_requirements", ""),
+                st.session_state.get("pipeline_test_cases_by_step", {}),
+                st.session_state.get("auth_url", ""),
+                st.session_state.get("auth_body", "{}"),
+                name=p.name,
+            )
+            st.success(f"已保存: {len(p.steps)}步, {step_info}")
+        except Exception as e:
+            st.error(f"保存失败: {e}")
+with col_load:
+    st.write("")
+    if st.button("📂 加载", width='stretch', help="从本地存档恢复"):
+        st.session_state["_show_load_ui"] = True
+
+if st.session_state.get("_show_load_ui"):
+    from api_test_workbench.engine.session_store import list_saves as list_session_saves, load as session_load
+    saves = list_session_saves()
+    if saves:
+        save_names = [f"{s['saved_at']} — {s['pipeline_name']}" for s in saves]
+        col1, col2, col3 = st.columns([2, 1, 0.5])
+        with col1:
+            selected_idx = st.selectbox("选择存档", range(len(save_names)),
+                format_func=lambda i: save_names[i], key="load_select_idx")
+        with col2:
+            st.write("")
+            if st.button("确认加载", key="load_confirm_btn"):
+                data = session_load(saves[selected_idx]["path"])
+                if data:
+                    p = data["pipeline"]
+                    step_info = "、".join(f"Step{i+1}:{s.config.method}" for i, s in enumerate(p.steps))
+                    st.session_state.pipeline = p
+                    st.session_state.field_requirements = data["field_requirements"]
+                    st.session_state.pipeline_test_cases_by_step = data["pipeline_test_cases_by_step"]
+                    st.session_state.auth_url = data["auth_url"]
+                    st.session_state.auth_body = data["auth_body"]
+                    st.session_state.pipeline_results = None
+                    # 清除所有步骤相关 widget 键，强制从加载数据重新初始化
+                    for k in list(st.session_state.keys()):
+                        if any(k.startswith(p) for p in (
+                            "step_widget_ver_", "step_url_", "step_method_",
+                            "step_headers_", "step_body_", "step_name_",
+                            "step_curl_", "step_ignored_",
+                        )):
+                            del st.session_state[k]
+                    st.session_state["_show_load_ui"] = False
+                    st.success(f"已恢复: {len(p.steps)}步 [{step_info}], {sum(len(v) for v in data['pipeline_test_cases_by_step'].values())} 条用例")
+                    st.rerun()
+                else:
+                    st.error("加载失败")
+        with col3:
+            st.write("")
+            if st.button("✕", key="load_close_btn", help="关闭加载面板"):
+                st.session_state["_show_load_ui"] = False
+                st.rerun()
+    else:
+        st.info("暂无存档")
+        st.session_state["_show_load_ui"] = False
 
 # ==================== 初始化 Session State ====================
 
@@ -238,16 +309,27 @@ def _render_pipeline_flow(steps: list) -> str:
     colors = ["#4CAF50", "#2196F3", "#FF9800", "#9C27B0", "#F44336", "#00BCD4", "#795548", "#607D8B"]
     for i, step in enumerate(steps):
         color = colors[i % len(colors)]
-        boxes.append(
-            f'<div style="display:inline-flex;align-items:center;padding:10px 18px;margin:4px 0;'
-            f'border:2px solid {color};border-radius:10px;text-align:center;'
-            f'background:linear-gradient(135deg, #f9f9f9 0%, #fff 100%);min-width:100px;'
-            f'box-shadow:0 2px 6px rgba(0,0,0,0.08)">'
-            f'<div><div style="font-size:12px;color:{color};font-weight:bold;">Step {i+1}</div>'
-            f'<div style="font-size:13px;color:#333;margin-top:2px;"><b>{step.name}</b></div>'
-            f'<div style="font-size:11px;color:#999;margin-top:1px;">{step.config.method}</div></div>'
-            f'</div>'
-        )
+        if step.ignored:
+            boxes.append(
+                f'<div style="display:inline-flex;align-items:center;padding:10px 18px;margin:4px 0;'
+                f'border:2px dashed #666;border-radius:10px;text-align:center;'
+                f'background:#2a2a2a;min-width:100px;opacity:0.5">'
+                f'<div><div style="font-size:12px;color:#888;font-weight:bold;">Step {i+1} 🚫</div>'
+                f'<div style="font-size:13px;color:#888;margin-top:2px;"><s>{step.name}</s></div>'
+                f'<div style="font-size:11px;color:#888;margin-top:1px;">{step.config.method}</div></div>'
+                f'</div>'
+            )
+        else:
+            boxes.append(
+                f'<div style="display:inline-flex;align-items:center;padding:10px 18px;margin:4px 0;'
+                f'border:2px solid {color};border-radius:10px;text-align:center;'
+                f'background:linear-gradient(135deg, #f9f9f9 0%, #fff 100%);min-width:100px;'
+                f'box-shadow:0 2px 6px rgba(0,0,0,0.08)">'
+                f'<div><div style="font-size:12px;color:{color};font-weight:bold;">Step {i+1}</div>'
+                f'<div style="font-size:13px;color:#333;margin-top:2px;"><b>{step.name}</b></div>'
+                f'<div style="font-size:11px;color:#999;margin-top:1px;">{step.config.method}</div></div>'
+                f'</div>'
+            )
         if i < len(steps) - 1:
             boxes.append(
                 '<div style="display:inline-flex;align-items:center;font-size:20px;'
@@ -311,14 +393,17 @@ for i, step in enumerate(steps):
         st.session_state[ver_key] = 0
     ver = st.session_state[ver_key]
 
-    with st.expander(f"Step {i+1}：{step.name or '(未命名)'}  — {step.config.method} {step.config.url or '(未设置URL)'}", expanded=(i == 0)):
-        col_name, col_method, col_failure = st.columns([3, 1, 1.5])
+    with st.expander(f"{'🚫 ' if step.ignored else ''}Step {i+1}：{step.name or '(未命名)'}  — {step.config.method} {step.config.url or '(未设置URL)'}", expanded=(i == 0)):
+        col_name, col_method, col_failure, col_ignore = st.columns([2.5, 1, 1.2, 0.8])
         with col_name:
             step.name = st.text_input(f"步骤名称", value=step.name, key=f"step_name_{i}", placeholder="如：创建订单")
         with col_method:
             step.config.method = st.selectbox("Method", ["POST", "GET", "PUT", "DELETE"], key=f"step_method_{i}_v{ver}", index=["POST", "GET", "PUT", "DELETE"].index(step.config.method) if step.config.method in ["POST", "GET", "PUT", "DELETE"] else 0)
         with col_failure:
             step.on_failure = st.selectbox("失败策略", ["stop", "continue"], key=f"step_failure_{i}", index=0 if step.on_failure == "stop" else 1, help="stop=停止后续步骤, continue=忽略错误继续执行")
+        with col_ignore:
+            st.write("")
+            step.ignored = st.checkbox("忽略", value=step.ignored, key=f"step_ignored_{i}", help="跳过此步骤，数据仍向下传递")
 
         step.config.url = st.text_input("接口地址", value=step.config.url, key=f"step_url_{i}_v{ver}", placeholder="http://bird.ob.shuyilink.com/linkim-pc/admin-console/tooling/sparePartDevice")
 
@@ -724,3 +809,126 @@ if pipeline_results:
                             st.json(result.response_body)
                         else:
                             st.text(str(result.response_body)[:2000])
+
+def _init_session_state():
+    defaults = {
+        "pipeline": Pipeline(name="我的测试链路", steps=[_create_default_step()]),
+        "pipeline_test_cases_by_step": {},
+        "pipeline_results": None,
+        "auth_url": "http://bird.ob.shuyilink.com/auth/auth-login",
+        "auth_body": '{"username": "", "password": ""}',
+        "auth_session": None,
+        "auth_ok": False,
+        "field_requirements": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            if k == "field_requirements":
+                st.session_state[k] = st.session_state.get("_field_requirements_backup", v)
+            else:
+                st.session_state[k] = v
+
+    # 向后兼容：从旧版 session state 迁移（仅执行一次）
+    if "api_url" in st.session_state and st.session_state.api_url and not st.session_state.get("_backward_compat_done"):
+        if not st.session_state.pipeline.steps[0].config.url:
+            st.session_state.pipeline.steps[0].config.url = st.session_state.api_url
+            st.session_state.pipeline.steps[0].config.method = st.session_state.get("api_method", "POST")
+        st.session_state["_backward_compat_done"] = True
+_init_session_state()
+
+
+# ==================== 辅助函数 ====================
+
+def _render_pipeline_flow(steps: list) -> str:
+    """渲染 Pipeline 可视化流程条"""
+    if not steps:
+        return ""
+    boxes = []
+    colors = ["#4CAF50", "#2196F3", "#FF9800", "#9C27B0", "#F44336", "#00BCD4", "#795548", "#607D8B"]
+    for i, step in enumerate(steps):
+        color = colors[i % len(colors)]
+        if step.ignored:
+            boxes.append(
+                f'<div style="display:inline-flex;align-items:center;padding:10px 18px;margin:4px 0;'
+                f'border:2px dashed #999;border-radius:10px;text-align:center;'
+                f'background:#f5f5f5;min-width:100px;opacity:0.6">'
+                f'<div><div style="font-size:12px;color:#999;font-weight:bold;">Step {i+1} 🚫</div>'
+                f'<div style="font-size:13px;color:#999;margin-top:2px;"><s>{step.name}</s></div>'
+                f'<div style="font-size:11px;color:#999;margin-top:1px;">{step.config.method}</div></div>'
+                f'</div>'
+            )
+        else:
+            boxes.append(
+                f'<div style="display:inline-flex;align-items:center;padding:10px 18px;margin:4px 0;'
+                f'border:2px solid {color};border-radius:10px;text-align:center;'
+                f'background:linear-gradient(135deg, #f9f9f9 0%, #fff 100%);min-width:100px;'
+                f'box-shadow:0 2px 6px rgba(0,0,0,0.08)">'
+                f'<div><div style="font-size:12px;color:{color};font-weight:bold;">Step {i+1}</div>'
+                f'<div style="font-size:13px;color:#333;margin-top:2px;"><b>{step.name}</b></div>'
+                f'<div style="font-size:11px;color:#999;margin-top:1px;">{step.config.method}</div></div>'
+                f'</div>'
+            )
+        if i < len(steps) - 1:
+            boxes.append(
+                '<div style="display:inline-flex;align-items:center;font-size:20px;'
+                'color:#aaa;margin:0 6px;font-weight:bold;">⟶</div>'
+            )
+    return (
+        '<div style="display:flex;align-items:center;flex-wrap:wrap;padding:12px 0;'
+        'overflow-x:auto;">' + "".join(boxes) + '</div>'
+    )
+
+
+def _backup_fr():
+    """备份字段定义内容，防止增删步骤等 rerun 操作丢失用户填写的数据（空值也备份）"""
+    st.session_state["_field_requirements_backup"] = st.session_state.get("field_requirements", "")
+
+
+def _scan_all_bindings(pipeline: Pipeline) -> list[DataBinding]:
+    """扫描所有步骤配置中的占位符，返回数据依赖列表"""
+    bindings = []
+    for idx, step in enumerate(pipeline.steps):
+        # 扫描 URL
+        for b in scan_placeholders(step.config.url, idx):
+            b.target_location = "url"
+            bindings.append(b)
+        # 扫描 Headers
+        for b in scan_placeholders(step.config.headers, idx):
+            b.target_location = "headers"
+            bindings.append(b)
+        # 扫描 Body template
+        for b in scan_placeholders(step.config.body_template, idx):
+            b.target_location = "body"
+            bindings.append(b)
+    return bindings
+
+
+def _render_step_result(sr):
+    """渲染单个步骤的执行结果"""
+    if sr.skipped:
+        st.info(f"此步骤被跳过：{sr.error_message}")
+        return
+    if sr.error_message:
+        st.error(sr.error_message)
+    if sr.extracted_data:
+        with st.expander("提取的数据（传给下游）", expanded=False):
+            st.json(sr.extracted_data)
+    for j, result in enumerate(sr.test_results):
+        icon = "✓" if result.passed else "✗"
+        with st.expander(f"{icon} {result.case_name} — status={result.actual_status_code} (期望 {result.expected_status_code})", expanded=not result.passed):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**请求 URL:** `{result.request_url}`")
+                st.markdown("**请求体:**")
+                st.json(result.request_body)
+            with c2:
+                st.markdown(f"**状态码:** {result.actual_status_code} (期望 {result.expected_status_code})")
+                if result.error_message:
+                    st.error(f"**错误:** {result.error_message}")
+                st.markdown("**响应体:**")
+                if isinstance(result.response_body, dict):
+                    st.json(result.response_body)
+                else:
+                    st.text(str(result.response_body)[:2000])
+
+
