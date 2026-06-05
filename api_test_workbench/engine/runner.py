@@ -13,6 +13,9 @@ from api_test_workbench.engine.models import (
 from api_test_workbench.engine.bindings import (
     _flatten_response, resolve_placeholders,
 )
+from api_test_workbench.engine.logger import setup_logger
+
+log = setup_logger("runner")
 
 
 def _safe_eval_assertion(assertion_logic: str, resp: requests.Response) -> tuple[bool, str]:
@@ -60,6 +63,21 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response) -> tuple
         return False, f"断言执行异常: {str(e)}"
 
 
+def _apply_body_deps(template, dep_body):
+    """将 data_dependencies.body 合并到 body_template，支持 dict 和 list"""
+    if not dep_body:
+        return template
+    try:
+        dep = json.loads(dep_body) if isinstance(dep_body, str) else dep_body
+    except (json.JSONDecodeError, TypeError):
+        return template
+    if isinstance(template, dict) and isinstance(dep, dict):
+        return {**template, **dep}
+    if isinstance(dep, (dict, list)):
+        return dep  # list/dict 直接替换
+    return template
+
+
 def run_single_test(
     tc: TestCase,
     api_config: ApiConfig,
@@ -85,6 +103,8 @@ def run_single_test(
         request_body = {}
 
     try:
+        log.info("%s %s", method, url[:120])
+        log.debug("请求体: %s", str(request_body)[:500])
         if method == "GET":
             resp = session.get(url, headers=api_config.headers, params=request_body)
         elif method in ("POST", "PUT", "DELETE", "PATCH"):
@@ -107,6 +127,7 @@ def run_single_test(
             response_json = resp.json() if resp.text else {}
         except (json.JSONDecodeError, ValueError):
             response_json = resp.text
+        log.debug("响应 %s: %s", resp.status_code, str(response_json)[:300])
 
         # 验证状态码
         passed = resp.status_code == tc.expected_status_code
@@ -130,6 +151,7 @@ def run_single_test(
         )
 
     except requests.RequestException as e:
+        log.error("请求异常 %s %s: %s", method, url[:120], str(e))
         return TestResult(
             case_id=tc.case_id,
             case_name=tc.case_name,
@@ -205,7 +227,7 @@ def execute_pipeline(
     test_cases_by_step: dict,
     progress_callback=None,
 ) -> PipelineResult:
-    """按顺序执行 Pipeline 的所有步骤，处理步骤间的数据传递。
+    """按用例链路执行 Pipeline：每条用例依次走完所有步骤。
 
     Args:
         pipeline: Pipeline 定义
@@ -216,29 +238,36 @@ def execute_pipeline(
     Returns:
         PipelineResult: 包含所有步骤结果的聚合结果
     """
-    context = PipelineContext()
-    step_results = []
+    total_steps = len(pipeline.steps)
+    # 取各步骤最大用例数
+    max_cases = max((len(v) for v in test_cases_by_step.values()), default=0)
+    if max_cases == 0:
+        return PipelineResult(pipeline_name=pipeline.name, overall_passed=True)
+
+    # 按步骤汇总结果
+    step_results_map = {i: [] for i in range(total_steps)}  # step_idx → [TestResult, ...]
     overall_passed = True
     stopped_at = -1
-    total = len(pipeline.steps)
 
-    for step_idx, step in enumerate(pipeline.steps):
-        step_tcs = test_cases_by_step.get(step_idx, [])
+    for case_idx in range(max_cases):
+        log.info("===== 链路 %d/%d 开始 =====", case_idx + 1, max_cases)
+        context = PipelineContext()
+        case_stopped = False
 
-        if not step_tcs:
-            sr = StepResult(step_index=step_idx, step_name=step.name, passed=True)
-            step_results.append(sr)
+        for step_idx, step in enumerate(pipeline.steps):
+            step_tcs = test_cases_by_step.get(step_idx, [])
+            if not step_tcs:
+                continue
+            # 该步骤用例数不足时复用最后一条（后续步骤通常只有1条，data_dependencies 自动引用当前链路数据）
+            tc = step_tcs[min(case_idx, len(step_tcs) - 1)]
             if progress_callback:
-                progress_callback(step_idx, total, sr)
-            continue
+                progress_callback(step_idx, total_steps,
+                    StepResult(step_index=step_idx, step_name=step.name, test_results=[]))
 
-        try:
-            resolved_config = resolve_step_config(step, context)
+            try:
+                resolved_config = resolve_step_config(step, context)
 
-            # 解析每个测试用例，应用 data_dependencies 到配置副本
-            resolved_tcs = []
-            for tc in step_tcs:
-                # 为该用例应用 data_dependencies（URL/Body/Headers 注入占位符）
+                # 应用 data_dependencies
                 tc_config = resolved_config
                 deps = getattr(tc, 'data_dependencies', {}) or {}
                 if deps:
@@ -249,14 +278,8 @@ def execute_pipeline(
                         headers=({**resolved_config.headers, **(
                             json.loads(deps["headers"]) if isinstance(deps.get("headers"), str) else deps["headers"]
                         )} if deps.get("headers") else resolved_config.headers),
-                        body_template=(
-                            {**resolved_config.body_template, **(
-                                json.loads(deps["body"]) if isinstance(deps.get("body"), str) else deps["body"]
-                            )} if deps.get("body") and isinstance(resolved_config.body_template, dict) else
-                            resolved_config.body_template
-                        ),
+                        body_template=_apply_body_deps(resolved_config.body_template, deps.get("body")),
                     )
-                    # 解析 deps 中可能含有的占位符
                     tc_config = resolve_step_config(
                         ApiStep(name=tc.case_name, config=tc_config), context
                     )
@@ -274,63 +297,73 @@ def execute_pipeline(
                     pre_condition=tc.pre_condition,
                     post_condition=tc.post_condition,
                 )
-                resolved_tcs.append((resolved_tc, tc_config))
 
-            results = []
-            for resolved_tc, tc_config in resolved_tcs:
-                results.append(run_single_test(resolved_tc, tc_config, session))
+                result = run_single_test(resolved_tc, tc_config, session)
+                log.info("链路 %d Step %d [%s] %s → %s",
+                         case_idx + 1, step_idx + 1, tc.case_name,
+                         "PASS" if result.passed else "FAIL", result.actual_status_code)
+                step_results_map[step_idx].append(result)
+
+                # 提取响应数据给下游步骤（断言失败时也提取，因为业务失败不代表没数据）
+                if isinstance(result.response_body, dict):
+                    context.extracted_values[step_idx] = _flatten_response(result.response_body)
+                elif result.response_body is not None:
+                    context.extracted_values[step_idx] = {"response.raw": str(result.response_body)[:200]}
+                else:
+                    context.extracted_values[step_idx] = {}
+
+                if not result.passed:
+                    overall_passed = False
+                    if step.on_failure == "stop":
+                        case_stopped = True
+                        if stopped_at < 0:
+                            stopped_at = step_idx
+
+            except Exception as e:
+                log.error("链路 %d Step %d 异常: %s", case_idx + 1, step_idx + 1, str(e))
+                step_results_map[step_idx].append(TestResult(
+                    case_id=tc.case_id, case_name=tc.case_name,
+                    passed=False, actual_status_code=0,
+                    expected_status_code=tc.expected_status_code,
+                    response_body=None,
+                    error_message=f"步骤执行异常: {str(e)}\n{traceback.format_exc()}",
+                ))
+                context.extracted_values[step_idx] = {}
+                overall_passed = False
+                if step.on_failure == "stop":
+                    case_stopped = True
+                    if stopped_at < 0:
+                        stopped_at = step_idx
+
+            if case_stopped:
+                break
+
+        if case_stopped and stopped_at >= 0:
+            # 当前 case 中断，剩余 case 全部跳过
+            # 但已跑完的步骤结果保留
+            pass
+
+    # 汇总 StepResult
+    step_results = []
+    for step_idx, step in enumerate(pipeline.steps):
+        results = step_results_map.get(step_idx, [])
+        if results:
             passed = all(r.passed for r in results)
-
-            # 从通过的用例中提取响应数据（优先选含 dict 响应的）
             extracted = {}
             for r in results:
-                if r.passed:
-                    if isinstance(r.response_body, dict):
-                        extracted = _flatten_response(r.response_body)
-                        break
-                    # 记录非 dict 响应但继续找更好的
-                    elif not extracted:
-                        extracted = {"response.raw": str(r.response_body)[:200]}
-            # 如果没有通过的用例或全部非 dict 且无内容，extracted 保持 {}
-
-            context.extracted_values[step_idx] = extracted
-            sr = StepResult(
-                step_index=step_idx,
-                step_name=step.name,
-                test_results=results,
-                passed=passed,
-                extracted_data=extracted,
-            )
-
-        except Exception as e:
-            sr = StepResult(
-                step_index=step_idx,
-                step_name=step.name,
-                passed=False,
-                error_message=f"步骤执行异常: {str(e)}\n{traceback.format_exc()}",
-            )
-            context.extracted_values[step_idx] = {}
-
-        step_results.append(sr)
-
-        if not sr.passed:
-            overall_passed = False
-            if step.on_failure == "stop":
-                stopped_at = step_idx
-                # 将剩余步骤标记为 skipped
-                for remaining in range(step_idx + 1, total):
-                    remaining_step = pipeline.steps[remaining]
-                    step_results.append(StepResult(
-                        step_index=remaining,
-                        step_name=remaining_step.name,
-                        skipped=True,
-                        error_message=f"因 Step {step_idx + 1} 失败而跳过",
-                    ))
-                break
-            # on_failure == "continue": 继续执行后续步骤，但无提取数据
-
-        if progress_callback:
-            progress_callback(step_idx, total, sr)
+                if r.passed and isinstance(r.response_body, dict):
+                    extracted = _flatten_response(r.response_body)
+                    break
+        else:
+            passed = True
+            extracted = {}
+        step_results.append(StepResult(
+            step_index=step_idx,
+            step_name=step.name,
+            test_results=results,
+            passed=passed,
+            extracted_data=extracted,
+        ))
 
     return PipelineResult(
         pipeline_name=pipeline.name,

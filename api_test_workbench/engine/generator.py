@@ -12,6 +12,9 @@ from api_test_workbench.config.prompts import (
     PIPELINE_SYSTEM_PROMPT, build_pipeline_user_prompt,
 )
 from api_test_workbench.engine.models import TestCase, Pipeline
+from api_test_workbench.engine.logger import setup_logger
+
+log = setup_logger("generator")
 
 # API Key 通过环境变量或 ~/.claude/credentials.json / settings.json 获取
 _ANTHROPIC_API_KEY: Optional[str] = None
@@ -74,7 +77,7 @@ def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, model: st
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": 4096,
+            "max_tokens": 16384,
             "temperature": 0.1,
         },
         timeout=120,
@@ -89,7 +92,7 @@ def _call_anthropic(api_key: str, system_prompt: str, user_prompt: str, model: s
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
-            model=model, max_tokens=4096,
+            model=model, max_tokens=16384,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -103,7 +106,7 @@ def _call_anthropic(api_key: str, system_prompt: str, user_prompt: str, model: s
                 "Content-Type": "application/json",
             },
             json={
-                "model": model, "max_tokens": 4096,
+                "model": model, "max_tokens": 16384,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_prompt}],
             },
@@ -167,11 +170,13 @@ def generate_test_cases(
     if not model:
         model = "claude-sonnet-4-20250514" if provider == "anthropic" else "deepseek-chat"
 
+    log.info("生成单接口测试用例: %s %s", method, api_url)
     user_prompt = build_user_prompt(field_requirements, api_url, method)
     raw = _call_ai(api_key, SYSTEM_PROMPT, user_prompt, model)
     data = _parse_json_with_retry(api_key, raw, model)
-
-    return [_make_test_case(tc) for tc in data.get("test_cases", [])]
+    test_cases = [_make_test_case(tc) for tc in data.get("test_cases", [])]
+    log.info("生成完成: %d 条用例", len(test_cases))
+    return test_cases
 
 
 def generate_pipeline_test_cases(
@@ -200,14 +205,16 @@ def generate_pipeline_test_cases(
         test_cases_per_step=test_cases_per_step,
     )
 
+    log.info("生成 Pipeline 测试用例: %d 步, 每步 %d 条", len(pipeline.steps), test_cases_per_step)
     raw = _call_ai(api_key, PIPELINE_SYSTEM_PROMPT, user_prompt, model)
     data = _parse_json_with_retry(api_key, raw, model)
 
     test_cases_by_step = {}
-    for step_data in data.get("steps", []):
-        step_idx = step_data.get("step_index", 0)
-        test_cases_by_step[step_idx] = [
+    for idx, step_data in enumerate(data.get("steps", [])):
+        # 用 AI 返回数组的位置作为步骤索引（0,1,2...），不依赖 AI 的 step_index 字段
+        test_cases_by_step[idx] = [
             _make_test_case(tc) for tc in step_data.get("test_cases", [])
         ]
-
+    total = sum(len(v) for v in test_cases_by_step.values())
+    log.info("Pipeline 生成完成: %d 步, %d 条用例", len(test_cases_by_step), total)
     return test_cases_by_step

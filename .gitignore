@@ -19,3 +19,6 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 工作台日志
+workbench.log

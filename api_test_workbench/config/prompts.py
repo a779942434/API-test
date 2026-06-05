@@ -56,7 +56,6 @@ PIPELINE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
   "steps": [
     {
       "step_name": "string",
-      "step_index": 0,
       "test_cases": [
         {
           "case_id": "string",
@@ -153,9 +152,9 @@ Pipeline 整体流程：
 {steps_block}
 
 要求：
-1. {count_hint}
-2. Step1 的 input_data 写死数据，后续步骤 input_data 留空 {{}}，数据依赖写入 data_dependencies
-3. 识别步骤间依赖，用 {{{{stepN.response.path}}}} 格式引用上游数据，标注 output_reference
+1. {count_hint}（重要：后续步骤 Step2/3/4... 只生成恰好 1 条用例！因为后续步骤通过 data_dependencies 引用上游数据，每条链路自动对应 Step1 的一条用例，不需要多条）
+2. Step1 的 input_data 用具体数据填充（写死），后续步骤 input_data 留空 {{}}，数据依赖写入 data_dependencies 用 {{{{stepN.response.path}}}} 格式
+3. 每个步骤标注 output_reference 字段
 4. expected_status_code 一律 200，正向 assertion_logic: resp_json['code'] == '0'，反向: resp_json['code'] != '0'
 5. input_data 只放需要变更的字段，Body 模板已有的值不要重复
 {chr(10)+scope_rule if scope_rule else ""}

@@ -34,10 +34,11 @@ def extract_value(data: dict, path: str) -> Any:
 
 
 def _flatten_response(data: dict, prefix: str = "response") -> dict[str, Any]:
-    """将嵌套 JSON 响应扁平化为单层 dict（点号 key）。
+    """将嵌套 JSON 响应扁平化为单层 dict（点号 key），并自动生成数组别名。
 
     返回示例：
-        {"response.code": "0", "response.data.id": 123, "response.data.items[0].name": "foo"}
+        {"response.code": "0", "response.data[0].id": 123, "response.data.id": 123}
+        （data 是数组时，data.id 自动别名到 data[0].id）
     """
     result = {}
 
@@ -52,6 +53,18 @@ def _flatten_response(data: dict, prefix: str = "response") -> dict[str, Any]:
             result[current_prefix] = obj
 
     _flatten(data, prefix)
+
+    # 生成数组别名：response.data[0].id → response.data.id
+    aliases = {}
+    import re as _re
+    for key in list(result.keys()):
+        m = _re.match(r'^(.+)\[0\](.*)$', key)
+        if m:
+            alias = m.group(1) + m.group(2)  # 去掉 [0]
+            if alias not in result:
+                aliases[alias] = result[key]
+    result.update(aliases)
+
     return result
 
 

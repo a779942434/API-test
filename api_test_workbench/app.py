@@ -642,12 +642,19 @@ if run_clicked:
         progress_bar = st.progress(0, "准备执行...")
         status_text = st.empty()
 
+        # 计算总步数（每条用例 × 每步）
+        total_cases = max((len(v) for v in tcs_by_step.values()), default=0)
+        total_steps = len(pipeline.steps)
+        total_ops = total_cases * total_steps
+        _counter = [0]  # mutable counter for closure
+
         def update_progress(current, total, result):
-            progress_bar.progress((current + 1) / total, f"执行 Step {current+1}/{total}")
-            icon = "✓" if result.passed else "✗"
-            if result.skipped:
-                icon = "⏭"
-            status_text.text(f"{icon} Step {current+1}: {result.step_name} — {'跳过' if result.skipped else f'{sum(1 for r in result.test_results if r.passed)}/{len(result.test_results)} 通过'}")
+            _counter[0] += 1
+            progress_bar.progress(_counter[0] / total_ops, f"链路 {_counter[0]}/{total_ops}")
+            if result.test_results:
+                last = result.test_results[-1]
+                icon = "✓" if last.passed else "✗"
+                status_text.text(f"{icon} Step {current+1}: {result.step_name} — {last.case_name}")
 
         with st.spinner("执行 Pipeline 中..."):
             results = execute_pipeline(
