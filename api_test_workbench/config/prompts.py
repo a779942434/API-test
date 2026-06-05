@@ -97,7 +97,12 @@ PIPELINE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
 - 最终请求体 = {{**body_template, **input_data}}
 - input_data 的字段会覆盖 body_template 同名字段
 - 用户说「保持不变」的字段 → 不要放入 input_data
-- 只有需要变更或随机生成的字段才放入 input_data"""
+- 只有需要变更或随机生成的字段才放入 input_data
+
+**正常数据模式**（用户明确声明「只需正常数据/不需要边界测试」时激活）：
+- 只生成正向真实数据，用于查看接口效果、填充真实业务数据
+- 禁止生成边界值、异常值、空值、特殊字符、SQL注入等测试用例
+- 每条用例的 input_data 填入真实可用的业务数据，不要故意构造边界场景"""
 
 
 def build_pipeline_user_prompt(
@@ -119,12 +124,25 @@ def build_pipeline_user_prompt(
         steps_block_parts.append("\n".join(parts))
     steps_block = "\n".join(steps_block_parts)
 
-    if test_cases_per_step <= 1:
+    # 检测用户是否只需要正常数据（非测试覆盖场景）
+    desc_lower = pipeline_description.lower()
+    normal_only = any(kw in desc_lower for kw in [
+        "正常数据", "不需要边界", "不需要异常", "只需真实", "仅真实数据",
+        "只造数据", "造数据", "只要正常", "无需边界", "无需异常",
+    ])
+
+    if normal_only:
+        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条**正常正向数据**"
+        scope_rule = "只生成正向真实数据，用于查看接口效果。禁止生成边界值、异常值、空值、超长/超短、SQL注入等测试用例。每条用例的 input_data 填入真实可用的业务数据"
+    elif test_cases_per_step <= 1:
         count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条正向核心用例"
+        scope_rule = "只聚焦核心数据链路"
     elif test_cases_per_step <= 5:
         count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条，分配：1 正向 + 1-2 边界值 + 剩余异常场景"
+        scope_rule = ""
     else:
         count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条，全面覆盖：正向/等价类/边界值/异常/跨字段依赖"
+        scope_rule = ""
 
     return f"""请根据以下 API Pipeline 描述生成多步骤测试用例。
 
@@ -140,7 +158,7 @@ Pipeline 整体流程：
 3. 识别步骤间依赖，用 {{{{stepN.response.path}}}} 格式引用上游数据，标注 output_reference
 4. expected_status_code 一律 200，正向 assertion_logic: resp_json['code'] == '0'，反向: resp_json['code'] != '0'
 5. input_data 只放需要变更的字段，Body 模板已有的值不要重复
-
+{chr(10)+scope_rule if scope_rule else ""}
 只输出 JSON，不要 Markdown 或额外文字。"""
 
 

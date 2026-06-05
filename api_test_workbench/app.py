@@ -475,23 +475,22 @@ st.text_area(
     "粘贴 Pipeline 字段定义（每步接口的字段约束、业务规则、数据依赖）",
     key="field_requirements",
     height=160,
-    placeholder="""描述每个步骤的字段约束和步骤间的数据依赖（用自然语言即可，无需手写占位符）：
+    placeholder='''描述每个步骤的字段约束和步骤间的数据依赖（用自然语言即可）：
 
-Step 1（创建订单）：
+Step 1:
 - name: string, 必填, 1-100位
 - quantity: int, 必填, 1-9999
 
-Step 2（查询订单）：
+Step 2:
 - 用 Step1 返回的 data.records[0].id 作为查询参数
 
-Step 3（更新订单状态）：
-- id: 取 Step1 返回数据里 data.records[0].id
-- status: 固定为 shipped
+数据依赖写法（AI 自动识别）：
+- "取 Step1 返回的 data.id"
+- "用 Step1 响应中 data.records[0].id 填入 URL"
 
-数据依赖写法示例（AI 自动识别并生成链路）：
-- 「取 Step1 返回的 data.id」
-- 「用 Step1 响应中 data.records[0].id 填入 URL」
-- 「获取 step1 返回数据里 data[0].id 或 data.records[0].id」""",
+范围控制（在第一行声明，默认不写=完整测试覆盖）：
+- "只需正常数据，不需要边界测试" -> 只生成正向真实数据
+- "完整测试覆盖" -> 包含边界值/异常/等价类'''
 )
 
 # 每次渲染后备份字段定义内容（含空值），防止增删步骤时丢失
