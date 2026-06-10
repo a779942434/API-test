@@ -44,6 +44,7 @@ class TestResult:
     error_message: str = ""
     request_body: dict = field(default_factory=dict)
     request_url: str = ""
+    response_time_ms: float = 0.0
 
 
 # ==================== Pipeline 相关模型 ====================

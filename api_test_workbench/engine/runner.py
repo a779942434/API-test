@@ -1,6 +1,8 @@
 """执行测试用例 + 断言验证"""
 
 import json
+import re
+import time
 import traceback
 from typing import Any
 
@@ -13,19 +15,79 @@ from api_test_workbench.engine.models import (
 from api_test_workbench.engine.bindings import (
     _flatten_response, resolve_placeholders,
 )
+from api_test_workbench.engine.environment import resolve_env_variables
 from api_test_workbench.engine.logger import setup_logger
 
 log = setup_logger("runner")
 
 
-def _safe_eval_assertion(assertion_logic: str, resp: requests.Response) -> tuple[bool, str]:
+class _StepData:
+    """包装扁平化步骤数据，支持 dict['key'] 和 .key.subkey 两种访问方式。
+
+    示例：
+        d = _StepData({"response.code": "0", "response.data.total": "5"})
+        d['response.data.total']   → "5"
+        d.response.data.total      → "5"  （与占位符语法一致）
+    """
+
+    def __init__(self, flat_dict: dict):
+        self._data = flat_dict
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        # 在扁平化字典中查找以 name 或 name.xxx 开头的 key
+        prefix = name + "."
+        matches = {}
+        for k, v in self._data.items():
+            if k == name:
+                # 精确匹配：直接返回值
+                return v
+            if k.startswith(prefix):
+                # 子路径匹配：去掉前缀后的部分作为子 key
+                sub_key = k[len(prefix):]
+                matches[sub_key] = v
+        if matches:
+            return _StepData(matches)
+        raise AttributeError(f"'{type(self).__name__}' 中没有 '{name}'（可用 key: {list(self._data.keys())}）")
+
+    def __repr__(self):
+        return f"StepData({self._data})"
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._data
+
+
+def _wrap_step_context(step_context: dict) -> dict:
+    """将 {step_index: flat_dict} 包装为 {step_index: _StepData}"""
+    if not step_context:
+        return {}
+    return {idx: _StepData(data) for idx, data in step_context.items()}
+
+
+def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_context: dict = None) -> tuple[bool, str]:
     """在受限上下文中执行断言逻辑字符串。
+
+    Args:
+        assertion_logic: 断言表达式字符串
+        resp: HTTP 响应对象
+        step_context: {step_index: flattened_response_dict} 上游步骤数据，注入为 step1/step2/...
 
     Returns:
         (passed, error_message)
     """
     if not assertion_logic:
         return True, ""
+
+    # 自动剥离断言中残留的占位符 {{xxx}} → xxx
+    # AI 有时会在 assertion_logic 中沿用占位符语法，Python eval 不识别 {{
+    assertion_logic = re.sub(r'\{\{(.+?)\}\}', r'\1', assertion_logic)
 
     # 安全检查：拒绝包含潜在沙箱逃逸特征的断言
     dangerous = ("__", "import", "exec", "compile", "open", "getattr", "setattr", "delattr")
@@ -54,13 +116,19 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response) -> tuple
         "None": None,
     }
 
+    # 注入上游步骤数据：step1, step2, ...（1-based，匹配占位符习惯）
+    # 包装为 _StepData 支持 dict['key'] 和 .key.subkey 两种访问
+    if step_context:
+        for step_idx, step_data in _wrap_step_context(step_context).items():
+            safe_context[f"step{step_idx + 1}"] = step_data
+
     try:
         result = eval(assertion_logic, {"__builtins__": {}}, safe_context)
         if result:
             return True, ""
         return False, f"断言失败: {assertion_logic}"
     except Exception as e:
-        return False, f"断言执行异常: {str(e)}"
+        return False, f"断言执行异常 [{type(e).__name__}]: {e}\n断言: {assertion_logic}"
 
 
 def _apply_body_deps(template, dep_body):
@@ -82,8 +150,16 @@ def run_single_test(
     tc: TestCase,
     api_config: ApiConfig,
     session: requests.Session,
+    step_context: dict = None,
 ) -> TestResult:
-    """执行单条测试用例"""
+    """执行单条测试用例
+
+    Args:
+        tc: 测试用例
+        api_config: API 配置
+        session: 已认证的 Session
+        step_context: {step_index: flattened_dict} 上游步骤数据，注入断言上下文
+    """
     url = api_config.url
     method = api_config.method.upper()
 
@@ -105,6 +181,7 @@ def run_single_test(
     try:
         log.info("%s %s", method, url[:120])
         log.debug("请求体: %s", str(request_body)[:500])
+        start = time.perf_counter()
         if method == "GET":
             resp = session.get(url, headers=api_config.headers, params=request_body)
         elif method in ("POST", "PUT", "DELETE", "PATCH"):
@@ -120,7 +197,9 @@ def run_single_test(
                 error_message=f"不支持的 HTTP 方法: {method}",
                 request_body=request_body,
                 request_url=url,
+                response_time_ms=0.0,
             )
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
 
         # 解析响应体
         try:
@@ -135,7 +214,7 @@ def run_single_test(
         # 如果状态码通过，执行附加断言
         assertion_error = ""
         if passed and tc.assertion_logic:
-            assertion_passed, assertion_error = _safe_eval_assertion(tc.assertion_logic, resp)
+            assertion_passed, assertion_error = _safe_eval_assertion(tc.assertion_logic, resp, step_context)
             passed = assertion_passed
 
         return TestResult(
@@ -148,9 +227,11 @@ def run_single_test(
             error_message=assertion_error,
             request_body=request_body,
             request_url=url,
+            response_time_ms=elapsed_ms,
         )
 
     except requests.RequestException as e:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
         log.error("请求异常 %s %s: %s", method, url[:120], str(e))
         return TestResult(
             case_id=tc.case_id,
@@ -162,6 +243,7 @@ def run_single_test(
             error_message=f"请求异常: {str(e)}\n{traceback.format_exc()}",
             request_body=request_body,
             request_url=url,
+            response_time_ms=elapsed_ms,
         )
 
 
@@ -186,22 +268,32 @@ def get_auth_session(auth_endpoint: str, auth_body: dict) -> requests.Session:
     session = requests.Session()
     session.headers.update({"Content-Type": "application/json"})
 
+    log.info("登录请求: POST %s", auth_endpoint)
     resp = session.post(auth_endpoint, json=auth_body)
     if resp.status_code not in (200, 302):
-        raise RuntimeError(f"登录失败 status={resp.status_code}: {resp.text}")
+        log.error("登录失败: %s → status=%s", auth_endpoint, resp.status_code)
+        raise RuntimeError(
+            f"登录失败 [{resp.status_code}] — 请检查环境 Auth URL 是否正确\n"
+            f"请求地址: POST {auth_endpoint}\n"
+            f"响应: {resp.text[:300]}"
+        )
 
     result = resp.json()
     if result.get("code") != '0':
         raise RuntimeError(f"登录业务失败: {result}")
 
+    log.info("登录成功: %s", auth_endpoint)
     return session
 
 
 # ==================== Pipeline 执行引擎 ====================
 
 
-def resolve_step_config(step: ApiStep, context: PipelineContext) -> ApiConfig:
-    """将步骤配置中的所有占位符替换为实际值，返回新的 ApiConfig"""
+def resolve_step_config(step: ApiStep, context: PipelineContext, env_variables: dict = None) -> ApiConfig:
+    """将步骤配置中的所有占位符替换为实际值，返回新的 ApiConfig
+
+    解析顺序：先步骤间数据绑定 ({{stepN.path}}) → 再环境变量 ({{VAR_NAME}})
+    """
     resolved_url = resolve_placeholders(step.config.url, context)
     resolved_headers = resolve_placeholders(step.config.headers, context)
     resolved_body = resolve_placeholders(step.config.body_template, context)
@@ -209,6 +301,14 @@ def resolve_step_config(step: ApiStep, context: PipelineContext) -> ApiConfig:
         resolved_body = {}
     resolved_auth_body = resolve_placeholders(step.config.auth_body, context)
     resolved_auth_endpoint = resolve_placeholders(step.config.auth_endpoint, context)
+
+    # 第二遍：环境变量替换 {{VAR_NAME}}
+    if env_variables:
+        resolved_url = resolve_env_variables(resolved_url, env_variables)
+        resolved_headers = resolve_env_variables(resolved_headers, env_variables)
+        resolved_body = resolve_env_variables(resolved_body, env_variables)
+        resolved_auth_endpoint = resolve_env_variables(resolved_auth_endpoint, env_variables)
+        resolved_auth_body = resolve_env_variables(resolved_auth_body, env_variables)
 
     return ApiConfig(
         name=step.config.name or step.name,
@@ -226,6 +326,7 @@ def execute_pipeline(
     session: requests.Session,
     test_cases_by_step: dict,
     progress_callback=None,
+    env_variables: dict = None,
 ) -> PipelineResult:
     """按用例链路执行 Pipeline：每条用例依次走完所有步骤。
 
@@ -234,6 +335,7 @@ def execute_pipeline(
         session: 已认证的 requests.Session
         test_cases_by_step: {step_index: [TestCase, ...]}
         progress_callback: callable(step_idx, total_steps, StepResult)
+        env_variables: 环境变量映射 {"VAR_NAME": "value", ...}，用于 {{VAR}} 替换
 
     Returns:
         PipelineResult: 包含所有步骤结果的聚合结果
@@ -260,6 +362,7 @@ def execute_pipeline(
                 step_results_map[step_idx].append(TestResult(
                     case_id="", case_name=f"(已忽略)", passed=True,
                     actual_status_code=0, expected_status_code=0, response_body=None,
+                    response_time_ms=0.0,
                 ))
                 continue
 
@@ -273,7 +376,7 @@ def execute_pipeline(
                     StepResult(step_index=step_idx, step_name=step.name, test_results=[]))
 
             try:
-                resolved_config = resolve_step_config(step, context)
+                resolved_config = resolve_step_config(step, context, env_variables)
 
                 # 应用 data_dependencies
                 tc_config = resolved_config
@@ -289,7 +392,7 @@ def execute_pipeline(
                         body_template=_apply_body_deps(resolved_config.body_template, deps.get("body")),
                     )
                     tc_config = resolve_step_config(
-                        ApiStep(name=tc.case_name, config=tc_config), context
+                        ApiStep(name=tc.case_name, config=tc_config), context, env_variables
                     )
 
                 resolved_input = resolve_placeholders(tc.input_data, context)
@@ -306,7 +409,7 @@ def execute_pipeline(
                     post_condition=tc.post_condition,
                 )
 
-                result = run_single_test(resolved_tc, tc_config, session)
+                result = run_single_test(resolved_tc, tc_config, session, step_context=context.extracted_values)
                 log.info("链路 %d Step %d [%s] %s → %s",
                          case_idx + 1, step_idx + 1, tc.case_name,
                          "PASS" if result.passed else "FAIL", result.actual_status_code)
@@ -335,6 +438,7 @@ def execute_pipeline(
                     expected_status_code=tc.expected_status_code,
                     response_body=None,
                     error_message=f"步骤执行异常: {str(e)}\n{traceback.format_exc()}",
+                    response_time_ms=0.0,
                 ))
                 context.extracted_values[step_idx] = {}
                 overall_passed = False
@@ -370,6 +474,7 @@ def execute_pipeline(
             step_name=step.name,
             test_results=results,
             passed=passed,
+            skipped=step.ignored,
             extracted_data=extracted,
         ))
 

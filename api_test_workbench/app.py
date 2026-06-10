@@ -23,6 +23,12 @@ from api_test_workbench.engine.runner import (
 )
 from api_test_workbench.engine.bindings import scan_placeholders
 from api_test_workbench.engine.curl_parser import parse_curl
+from api_test_workbench.engine.reporter import generate_html_report, generate_json_report
+from api_test_workbench.engine.environment import (
+    init_default_environments, list_environments,
+    save_environment, delete_environment,
+    resolve_env_variables,
+)
 
 st.set_page_config(page_title="API 测试工作台 — Pipeline", layout="wide")
 
@@ -275,6 +281,11 @@ def _init_session_state():
         "auth_session": None,
         "auth_ok": False,
         "field_requirements": "",
+        "active_env": "",  # 当前激活的环境名，"" 表示不使用环境
+        "env_variables": {},  # 当前激活环境的变量映射
+        "show_env_editor": False,  # 是否打开环境编辑器
+        "_default_auth_url": "http://bird.ob.shuyilink.com/auth/auth-login",
+        "_default_auth_body": '{"username": "", "password": ""}',
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -356,9 +367,174 @@ def _scan_all_bindings(pipeline: Pipeline) -> list[DataBinding]:
     return bindings
 
 
-# ==================== ① Pipeline 配置 ====================
+# ==================== 环境管理（侧边栏） ====================
 
 _init_session_state()
+
+# 首次启动时创建默认环境
+init_default_environments()
+
+with st.sidebar:
+    st.markdown("### 🌍 环境管理")
+
+    envs = list_environments()
+    env_names = [e["name"] for e in envs]
+
+    # 环境选择器
+    options = ["(不使用环境)"] + env_names
+    current_idx = 0
+    if st.session_state.active_env and st.session_state.active_env in env_names:
+        current_idx = env_names.index(st.session_state.active_env) + 1
+
+    selected = st.selectbox(
+        "选择运行环境",
+        range(len(options)),
+        format_func=lambda i: ("✅ " if i > 0 else "") + options[i],
+        key="env_selector",
+        index=current_idx,
+        help="切换环境自动替换 URL 中的 {{VAR}} 占位符",
+    )
+
+    # 应用环境选择
+    if selected > 0:
+        env_name = env_names[selected - 1]
+        if st.session_state.active_env != env_name:
+            # 保存当前手动设置的 Auth 配置（用于取消环境时恢复）
+            if not st.session_state.active_env:
+                st.session_state._default_auth_url = st.session_state.auth_url
+                st.session_state._default_auth_body = st.session_state.auth_body
+            st.session_state.active_env = env_name
+            env_data = next((e for e in envs if e["name"] == env_name), None)
+            if env_data:
+                env_vars = dict(env_data.get("variables", {}))
+                # 自动加入 BASE 简写
+                if env_data.get("base_url") and "BASE" not in env_vars:
+                    env_vars["BASE"] = env_data["base_url"]
+                st.session_state.env_variables = env_vars
+                # 应用环境的 Auth 配置
+                if env_data.get("auth_endpoint"):
+                    st.session_state.auth_url = env_data["auth_endpoint"]
+                if env_data.get("auth_body"):
+                    st.session_state.auth_body = json.dumps(env_data["auth_body"], ensure_ascii=False)
+                st.session_state.auth_ok = False
+                st.session_state.auth_session = None
+    else:
+        if st.session_state.active_env:
+            # 恢复手动设置的 Auth 配置
+            st.session_state.auth_url = st.session_state._default_auth_url
+            st.session_state.auth_body = st.session_state._default_auth_body
+            st.session_state.auth_ok = False
+            st.session_state.auth_session = None
+        st.session_state.active_env = ""
+        st.session_state.env_variables = {}
+
+    # 当前环境状态
+    if st.session_state.active_env:
+        st.caption(f"当前: **{st.session_state.active_env}** · {len(st.session_state.env_variables)} 个变量")
+    else:
+        st.caption("未启用环境（URL 原样使用）")
+
+    st.divider()
+
+    # 环境编辑器
+    if st.button("管理环境" if not st.session_state.show_env_editor else "收起编辑器", use_container_width=True):
+        st.session_state.show_env_editor = not st.session_state.show_env_editor
+
+    if st.session_state.show_env_editor:
+        env_list = list_environments()
+        env_names_for_edit = [e["name"] for e in env_list]
+
+        # 选择要编辑的环境
+        edit_target = st.selectbox(
+            "编辑环境",
+            ["[新建环境]"] + env_names_for_edit,
+            key="env_edit_target",
+        )
+
+        if edit_target == "[新建环境]":
+            env_name_input = st.text_input("环境名称", key="env_new_name", placeholder="如：dev, staging, prod")
+            env_base_url = st.text_input("Base URL", key="env_new_base", placeholder="https://api.example.com")
+            env_vars_raw = st.text_area(
+                "变量 (每行一个: VAR_NAME=value)",
+                key="env_new_vars",
+                height=100,
+                placeholder="BASE=https://api.example.com\nTOKEN=xxx",
+            )
+            env_auth_url = st.text_input("Auth URL (可选)", key="env_new_auth_url", placeholder="留空使用主登录表单")
+            env_auth_body = st.text_area("Auth Body JSON (可选)", key="env_new_auth_body", height=60, placeholder='{"username":"","password":""}')
+
+            col_save, _ = st.columns([1, 2])
+            with col_save:
+                if st.button("💾 保存环境", use_container_width=True, type="primary"):
+                    if not env_name_input.strip():
+                        st.error("请输入环境名称")
+                    else:
+                        # 解析变量
+                        variables = {}
+                        for line in env_vars_raw.strip().split("\n"):
+                            line = line.strip()
+                            if "=" in line:
+                                k, _, v = line.partition("=")
+                                variables[k.strip()] = v.strip()
+                        try:
+                            auth_body = json.loads(env_auth_body) if env_auth_body.strip() else {}
+                        except json.JSONDecodeError:
+                            auth_body = {}
+                        save_environment(env_name_input.strip(), env_base_url.strip(), variables,
+                                         env_auth_url.strip(), auth_body)
+                        st.success(f"环境 '{env_name_input}' 已保存")
+                        st.rerun()
+        else:
+            # 加载已有环境进行编辑
+            env_data = next((e for e in env_list if e["name"] == edit_target), None)
+            if env_data:
+                edited_name = st.text_input("环境名称", value=env_data["name"], key="env_edit_name")
+                edited_base = st.text_input("Base URL", value=env_data["base_url"], key="env_edit_base")
+                vars_text = "\n".join(f"{k}={v}" for k, v in env_data.get("variables", {}).items())
+                edited_vars = st.text_area("变量", value=vars_text, key="env_edit_vars", height=100)
+                edited_auth_url = st.text_input("Auth URL (可选)", value=env_data.get("auth_endpoint", ""), key="env_edit_auth_url_val")
+                auth_body_val = json.dumps(env_data.get("auth_body", {}), ensure_ascii=False, indent=2)
+                edited_auth_body = st.text_area("Auth Body JSON (可选)", value=auth_body_val, key="env_edit_auth_body", height=60)
+
+                col_save, col_delete = st.columns(2)
+                with col_save:
+                    if st.button("💾 更新环境", use_container_width=True, type="primary"):
+                        variables = {}
+                        for line in edited_vars.strip().split("\n"):
+                            line = line.strip()
+                            if "=" in line:
+                                k, _, v = line.partition("=")
+                                variables[k.strip()] = v.strip()
+                        try:
+                            auth_body = json.loads(edited_auth_body) if edited_auth_body.strip() else {}
+                        except json.JSONDecodeError:
+                            auth_body = {}
+                        save_environment(edited_name.strip(), edited_base.strip(), variables,
+                                         edited_auth_url.strip(), auth_body)
+                        if st.session_state.active_env == edit_target:
+                            st.session_state.active_env = edited_name.strip()
+                            st.session_state.env_variables = variables
+                            if edited_base.strip() and "BASE" not in variables:
+                                st.session_state.env_variables["BASE"] = edited_base.strip()
+                        st.success("已更新")
+                        st.rerun()
+                with col_delete:
+                    if st.button("🗑 删除", use_container_width=True):
+                        delete_environment(edit_target)
+                        if st.session_state.active_env == edit_target:
+                            st.session_state.active_env = ""
+                            st.session_state.env_variables = {}
+                        st.success(f"已删除环境 '{edit_target}'")
+                        st.rerun()
+
+    # 变量预览
+    if st.session_state.active_env and st.session_state.env_variables:
+        with st.expander(f"变量预览 ({len(st.session_state.env_variables)})"):
+            for k, v in st.session_state.env_variables.items():
+                st.caption(f"`{{{{{k}}}}}` → `{v}`")
+
+
+# ==================== ① Pipeline 配置 ====================
 
 st.header("🔗 ① Pipeline 配置")
 
@@ -388,14 +564,14 @@ for i, step in enumerate(steps):
     with st.expander(f"{'🚫 ' if step.ignored else ''}Step {i+1}：{step.name or '(未命名)'}  — {step.config.method} {step.config.url or '(未设置URL)'}", expanded=(i == 0)):
         col_name, col_method, col_failure, col_ignore = st.columns([2.5, 1, 1.2, 0.8])
         with col_name:
-            step.name = st.text_input(f"步骤名称", value=step.name, key=f"step_name_{i}", placeholder="如：创建订单")
+            step.name = st.text_input(f"步骤名称", value=step.name, key=f"step_name_{i}_v{ver}", placeholder="如：创建订单")
         with col_method:
             step.config.method = st.selectbox("Method", ["POST", "GET", "PUT", "DELETE"], key=f"step_method_{i}_v{ver}", index=["POST", "GET", "PUT", "DELETE"].index(step.config.method) if step.config.method in ["POST", "GET", "PUT", "DELETE"] else 0)
         with col_failure:
-            step.on_failure = st.selectbox("失败策略", ["stop", "continue"], key=f"step_failure_{i}", index=0 if step.on_failure == "stop" else 1, help="stop=停止后续步骤, continue=忽略错误继续执行")
+            step.on_failure = st.selectbox("失败策略", ["stop", "continue"], key=f"step_failure_{i}_v{ver}", index=0 if step.on_failure == "stop" else 1, help="stop=停止后续步骤, continue=忽略错误继续执行")
         with col_ignore:
             st.write("")
-            step.ignored = st.checkbox("忽略", value=step.ignored, key=f"step_ignored_{i}", help="跳过此步骤，数据仍向下传递")
+            step.ignored = st.checkbox("忽略", value=step.ignored, key=f"step_ignored_{i}_v{ver}", help="跳过此步骤，数据仍向下传递")
 
         step.config.url = st.text_input("接口地址", value=step.config.url, key=f"step_url_{i}_v{ver}", placeholder="http://bird.ob.shuyilink.com/linkim-pc/admin-console/tooling/sparePartDevice")
         # ── curl 命令粘贴解析 ──
@@ -676,6 +852,11 @@ st.header("🔐 ③ 认证 & 执行")
 
 # 登录区
 with st.expander("登录认证", expanded=not st.session_state.auth_ok):
+    # 环境 Auth 提示
+    if st.session_state.active_env:
+        env_data = next((e for e in list_environments() if e["name"] == st.session_state.active_env), None)
+        if env_data and (env_data.get("auth_endpoint") or env_data.get("auth_body")):
+            st.caption(f"🌍 使用环境 **{st.session_state.active_env}** 的认证配置")
     c1, c2, c3 = st.columns([3, 2, 1])
     with c1:
         st.text_input("登录接口地址", key="auth_url", placeholder="http://bird.ob.shuyilink.com/auth/auth-login")
@@ -738,11 +919,59 @@ if run_clicked:
                 session=st.session_state.auth_session,
                 test_cases_by_step=tcs_by_step,
                 progress_callback=update_progress,
+                env_variables=st.session_state.get("env_variables") or None,
             )
             st.session_state.pipeline_results = results
 
         progress_bar.empty()
         status_text.empty()
+
+
+def _render_response_time(ms: float):
+    """渲染带颜色编码的响应时间"""
+    if ms <= 0:
+        return
+    if ms < 500:
+        color = "#22C55E"   # green
+    elif ms < 2000:
+        color = "#F59E0B"   # amber
+    else:
+        color = "#EF4444"   # red
+    st.markdown(
+        f"**耗时:** <span style='color:{color};font-weight:600;'>{ms:.0f} ms</span>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_step_result(sr):
+    """渲染单个步骤的执行结果"""
+    if sr.skipped:
+        st.info(f"此步骤被跳过：{sr.error_message}")
+        return
+    if sr.error_message:
+        st.error(sr.error_message)
+    if sr.extracted_data:
+        with st.expander("提取的数据（传给下游）", expanded=False):
+            st.json(sr.extracted_data)
+    for j, result in enumerate(sr.test_results):
+        icon = "✓" if result.passed else "✗"
+        with st.expander(f"{icon} {result.case_name} — status={result.actual_status_code} (期望 {result.expected_status_code})", expanded=not result.passed):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**请求 URL:** `{result.request_url}`")
+                st.markdown("**请求体:**")
+                st.json(result.request_body)
+            with c2:
+                st.markdown(f"**状态码:** {result.actual_status_code} (期望 {result.expected_status_code})")
+                _render_response_time(result.response_time_ms)
+                if result.error_message:
+                    st.error(f"**错误:** {result.error_message}")
+                st.markdown("**响应体:**")
+                if isinstance(result.response_body, dict):
+                    st.json(result.response_body)
+                else:
+                    st.text(str(result.response_body)[:2000])
+
 
 # 展示结果
 pipeline_results = st.session_state.pipeline_results
@@ -792,6 +1021,7 @@ if pipeline_results:
                                 st.json(r.request_body)
                             with c2:
                                 st.markdown(f"**状态码:** {r.actual_status_code} (期望 {r.expected_status_code})")
+                                _render_response_time(r.response_time_ms)
                                 if r.error_message:
                                     st.error(f"**错误:** {r.error_message}")
                                 st.markdown("**响应体:**")
@@ -800,100 +1030,31 @@ if pipeline_results:
                                 else:
                                     st.text(str(r.response_body)[:2000])
 
-
-
-# ==================== 辅助函数 ====================
-
-def _render_pipeline_flow(steps: list) -> str:
-    """渲染 Pipeline 可视化流程条"""
-    if not steps:
-        return ""
-    boxes = []
-    colors = ["#4CAF50", "#2196F3", "#FF9800", "#9C27B0", "#F44336", "#00BCD4", "#795548", "#607D8B"]
-    for i, step in enumerate(steps):
-        color = colors[i % len(colors)]
-        if step.ignored:
-            boxes.append(
-                f'<div style="display:inline-flex;align-items:center;padding:10px 18px;margin:4px 0;'
-                f'border:2px dashed #999;border-radius:10px;text-align:center;'
-                f'background:#f5f5f5;min-width:100px;opacity:0.6">'
-                f'<div><div style="font-size:12px;color:#999;font-weight:bold;">Step {i+1} 🚫</div>'
-                f'<div style="font-size:13px;color:#999;margin-top:2px;"><s>{step.name}</s></div>'
-                f'<div style="font-size:11px;color:#999;margin-top:1px;">{step.config.method}</div></div>'
-                f'</div>'
-            )
-        else:
-            boxes.append(
-                f'<div style="display:inline-flex;align-items:center;padding:10px 18px;margin:4px 0;'
-                f'border:2px solid {color};border-radius:10px;text-align:center;'
-                f'background:linear-gradient(135deg, #f9f9f9 0%, #fff 100%);min-width:100px;'
-                f'box-shadow:0 2px 6px rgba(0,0,0,0.08)">'
-                f'<div><div style="font-size:12px;color:{color};font-weight:bold;">Step {i+1}</div>'
-                f'<div style="font-size:13px;color:#333;margin-top:2px;"><b>{step.name}</b></div>'
-                f'<div style="font-size:11px;color:#999;margin-top:1px;">{step.config.method}</div></div>'
-                f'</div>'
-            )
-        if i < len(steps) - 1:
-            boxes.append(
-                '<div style="display:inline-flex;align-items:center;font-size:20px;'
-                'color:#aaa;margin:0 6px;font-weight:bold;">⟶</div>'
-            )
-    return (
-        '<div style="display:flex;align-items:center;flex-wrap:wrap;padding:12px 0;'
-        'overflow-x:auto;">' + "".join(boxes) + '</div>'
-    )
-
-
-def _backup_fr():
-    """备份字段定义内容，防止增删步骤等 rerun 操作丢失用户填写的数据（空值也备份）"""
-    st.session_state["_field_requirements_backup"] = st.session_state.get("field_requirements", "")
-
-
-def _scan_all_bindings(pipeline: Pipeline) -> list[DataBinding]:
-    """扫描所有步骤配置中的占位符，返回数据依赖列表"""
-    bindings = []
-    for idx, step in enumerate(pipeline.steps):
-        # 扫描 URL
-        for b in scan_placeholders(step.config.url, idx):
-            b.target_location = "url"
-            bindings.append(b)
-        # 扫描 Headers
-        for b in scan_placeholders(step.config.headers, idx):
-            b.target_location = "headers"
-            bindings.append(b)
-        # 扫描 Body template
-        for b in scan_placeholders(step.config.body_template, idx):
-            b.target_location = "body"
-            bindings.append(b)
-    return bindings
-
-
-def _render_step_result(sr):
-    """渲染单个步骤的执行结果"""
-    if sr.skipped:
-        st.info(f"此步骤被跳过：{sr.error_message}")
-        return
-    if sr.error_message:
-        st.error(sr.error_message)
-    if sr.extracted_data:
-        with st.expander("提取的数据（传给下游）", expanded=False):
-            st.json(sr.extracted_data)
-    for j, result in enumerate(sr.test_results):
-        icon = "✓" if result.passed else "✗"
-        with st.expander(f"{icon} {result.case_name} — status={result.actual_status_code} (期望 {result.expected_status_code})", expanded=not result.passed):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(f"**请求 URL:** `{result.request_url}`")
-                st.markdown("**请求体:**")
-                st.json(result.request_body)
-            with c2:
-                st.markdown(f"**状态码:** {result.actual_status_code} (期望 {result.expected_status_code})")
-                if result.error_message:
-                    st.error(f"**错误:** {result.error_message}")
-                st.markdown("**响应体:**")
-                if isinstance(result.response_body, dict):
-                    st.json(result.response_body)
-                else:
-                    st.text(str(result.response_body)[:2000])
+    # 报告导出按钮
+    st.divider()
+    st.subheader("📊 报告导出")
+    col_html, col_json, _ = st.columns([1, 1, 3])
+    with col_html:
+        html_report = generate_html_report(pipeline_results, st.session_state.pipeline)
+        st.download_button(
+            "📥 下载 HTML 报告",
+            data=html_report,
+            file_name=f"api_test_report_{pipeline_results.pipeline_name}.html",
+            mime="text/html",
+            use_container_width=True,
+            type="primary",
+        )
+    with col_json:
+        json_report = json.dumps(
+            generate_json_report(pipeline_results),
+            ensure_ascii=False, indent=2,
+        )
+        st.download_button(
+            "📥 下载 JSON 报告",
+            data=json_report,
+            file_name=f"api_test_report_{pipeline_results.pipeline_name}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 
 
