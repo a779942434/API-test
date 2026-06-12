@@ -17,6 +17,7 @@ from api_test_workbench.engine.bindings import (
 )
 from api_test_workbench.engine.environment import resolve_env_variables
 from api_test_workbench.engine.logger import setup_logger
+from api_test_workbench.engine.utils import is_query_url, strip_placeholders
 
 log = setup_logger("runner")
 
@@ -85,9 +86,32 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_con
     if not assertion_logic:
         return True, ""
 
-    # 自动剥离断言中残留的占位符 {{xxx}} → xxx
-    # AI 有时会在 assertion_logic 中沿用占位符语法，Python eval 不识别 {{
-    assertion_logic = re.sub(r'\{\{(.+?)\}\}', r'\1', assertion_logic)
+    # 剥离 AI 残留占位符
+    assertion_logic = strip_placeholders(assertion_logic)
+
+    # 安全转换：将 data 字段的 .get() 转为防御式，兼容 data 为字符串（直接返回 ID）、
+    # 为 dict（对象）、为 None 三种情况
+    # resp_json.get('data', {}).get('id', 0) → safe_get(resp_json, 'data', 'id', 0)
+    # 规则：如果 data 是字符串 → 它就是 ID；如果是 dict → 取其 .id
+    def _safe_get(data, key, default=0):
+        if isinstance(data, dict):
+            return data.get(key, default)
+        if isinstance(data, str):
+            return int(data) if key == 'id' else default
+        return default
+
+    safe_context_extra = {"safe_get": _safe_get}
+    assertion_logic = re.sub(
+        r"(\w+)\.get\('(\w+)',\s*\{\}\)\.get\('(\w+)',\s*(\d+)\)",
+        r"safe_get(\1, '\2', '\3', \4)",
+        assertion_logic,
+    )
+    # 简化版：单层 .get('data', {}) 也保护
+    assertion_logic = re.sub(
+        r"(\w+)\.get\('(\w+)',\s*\{\}\)",
+        r"(\1.get('\2') or {})",
+        assertion_logic,
+    )
 
     # 安全检查：拒绝包含潜在沙箱逃逸特征的断言
     dangerous = ("__", "import", "exec", "compile", "open", "getattr", "setattr", "delattr")
@@ -114,6 +138,7 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_con
         "True": True,
         "False": False,
         "None": None,
+        "safe_get": _safe_get,
     }
 
     # 注入上游步骤数据：step1, step2, ...（1-based，匹配占位符习惯）
@@ -128,7 +153,12 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_con
             return True, ""
         return False, f"断言失败: {assertion_logic}"
     except Exception as e:
-        return False, f"断言执行异常 [{type(e).__name__}]: {e}\n断言: {assertion_logic}"
+        # 断言执行异常（如 data 字段是字符串而非对象导致 .get() 失败）
+        # 这不影响测试结果——断言失败就是 FAIL
+        hint = ""
+        if "object has no attribute 'get'" in str(e) or "AttributeError" in str(type(e).__name__):
+            hint = "（可能原因：API 返回的 data 字段不是对象类型，请用 (resp_json.get('data') or {}) 防御）"
+        return False, f"断言执行异常 [{type(e).__name__}]: {e}\n{hint}\n断言: {assertion_logic}"
 
 
 def _apply_body_deps(template, dep_body):
@@ -163,20 +193,31 @@ def run_single_test(
     url = api_config.url
     method = api_config.method.upper()
 
+    # 递归替换占位符: {{timestamp}} → 当前时间戳, {{index}} → 保留（已在生成阶段替换）
+    def _resolve_placeholders(obj):
+        if isinstance(obj, dict):
+            return {k: _resolve_placeholders(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_resolve_placeholders(v) for v in obj]
+        elif isinstance(obj, str):
+            return obj.replace("{{timestamp}}", str(int(time.time())))
+        return obj
+
     # 根据 body_template 类型构造请求体
-    #   dict: 以 body_template 为基础，input_data 字段覆盖合并
-    #   list: 直接使用数组作为请求体（input_data 忽略）
-    #   其他: 使用 input_data（dict）或空 dict
     template = api_config.body_template
     if isinstance(template, list):
-        request_body = template
+        request_body = _resolve_placeholders(template)
     elif isinstance(template, dict):
         data = tc.input_data if isinstance(tc.input_data, dict) else {}
-        request_body = {**template, **data}
+        request_body = _resolve_placeholders({**template, **data})
     elif isinstance(tc.input_data, dict):
-        request_body = tc.input_data
+        request_body = _resolve_placeholders(tc.input_data)
     else:
         request_body = {}
+
+    # Debug: 仅记录 cookie 数量和 header 名称，不打印敏感值
+    log.debug("Session cookie count: %d, header names: %s",
+              len(session.cookies), list(session.headers.keys()))
 
     try:
         log.info("%s %s", method, url[:120])
@@ -263,10 +304,12 @@ def run_all_tests(
     return results
 
 
-def get_auth_session(auth_endpoint: str, auth_body: dict) -> requests.Session:
-    """调用登录接口，返回已认证的 Session"""
+def get_auth_session(auth_endpoint: str, auth_body: dict, tenant_id: str = "") -> requests.Session:
+    """调用登录接口，返回已认证的 Session。tenant_id 可选，传入时合并到 Body"""
     session = requests.Session()
     session.headers.update({"Content-Type": "application/json"})
+    if tenant_id:
+        auth_body = {**auth_body, "tenantId": tenant_id}
 
     log.info("登录请求: POST %s", auth_endpoint)
     resp = session.post(auth_endpoint, json=auth_body)
@@ -282,7 +325,23 @@ def get_auth_session(auth_endpoint: str, auth_body: dict) -> requests.Session:
     if result.get("code") != '0':
         raise RuntimeError(f"登录业务失败: {result}")
 
-    log.info("登录成功: %s", auth_endpoint)
+    # 如果登录响应中包含 token/accessToken，自动注入 Authorization header
+    data = result.get("data", {}) or {}
+    token = (
+        result.get("token")
+        or result.get("access_token")
+        or data.get("token")
+        or data.get("accessToken")
+        or data.get("access_token")
+    )
+    if token:
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        log.info("登录成功，已注入 Bearer token: %s...", token[:20])
+        log.debug("登录响应 keys: %s", list(result.keys()))
+    else:
+        log.info("登录成功（Cookie 认证）: %s", auth_endpoint)
+        log.debug("登录响应 keys (无token): %s", list(result.keys()))
+
     return session
 
 
@@ -449,11 +508,6 @@ def execute_pipeline(
 
             if case_stopped:
                 break
-
-        if case_stopped and stopped_at >= 0:
-            # 当前 case 中断，剩余 case 全部跳过
-            # 但已跑完的步骤结果保留
-            pass
 
     # 汇总 StepResult
     step_results = []

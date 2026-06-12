@@ -14,6 +14,7 @@ import zipfile
 from urllib.parse import urlparse
 
 from api_test_workbench.engine.models import Pipeline, TestCase, ApiStep
+from api_test_workbench.engine.utils import is_write_step, is_query_url, strip_placeholders
 
 
 # ==================== 常量 ====================
@@ -153,8 +154,7 @@ def _convert_assertion(assertion_logic: str) -> str:
     if not assertion_logic or not assertion_logic.strip():
         return "pass  # 无断言"
 
-    expr = assertion_logic.strip()
-    expr = re.sub(r'\{\{(.+?)\}\}', r'\1', expr)
+    expr = strip_placeholders(assertion_logic.strip())
 
     # resp_json['key'] → result.get('key')
     expr = re.sub(r"resp_json\['([^']+)'\]", r"result.get('\1')", expr)
@@ -202,28 +202,9 @@ def _infer_delete_url(create_url: str) -> str:
     return f"{path}/{{created_id}}"
 
 
-_QUERY_URL_KEYWORDS = ['search', 'page', 'list', 'query', 'find', 'get', 'option', 'select']
-
-
-def _is_query_operation(url: str) -> bool:
-    """判断 URL 是否为查询/搜索类操作（非写操作）"""
-    url_lower = url.lower()
-    return any(kw in url_lower for kw in _QUERY_URL_KEYWORDS)
-
-
-def _is_write_step(step) -> bool:
-    """判断步骤是否为写操作（POST/PUT 且非查询），需要动态数据 + teardown"""
-    method = step.config.method.upper() if hasattr(step, 'config') else getattr(step, 'method', 'GET').upper()
-    is_write_method = method in ('POST', 'PUT', 'PATCH')
-    if not is_write_method:
-        return False
-    url = step.config.url if hasattr(step, 'config') else getattr(step, 'url', '')
-    return not _is_query_operation(url)
-
-
 def _gen_teardown_comment(step_idx: int, create_url: str) -> str:
     """为写操作（POST/PUT 且非查询）生成数据清理注释框架"""
-    if _is_query_operation(create_url):
+    if is_query_url(create_url):
         return ""
     delete_hint = _infer_delete_url(create_url)
     return (
@@ -248,6 +229,7 @@ class PytestExporter:
         auth_body: dict = None,
         env_name: str = "default",
         client_id: str = "",
+        data_only: bool = False,
     ):
         self.pipeline = pipeline
         self.test_cases_by_step = test_cases_by_step
@@ -255,6 +237,7 @@ class PytestExporter:
         self.auth_body = auth_body or {}
         self.env_name = env_name
         self.client_id = client_id
+        self.data_only = data_only
 
         # 预计算各步骤的 base_url 和 path
         self._step_info: dict[int, dict] = {}
@@ -418,13 +401,14 @@ def api_headers(env_config):
 
     def _gen_test_file(self) -> str:
         class_name = _sanitize_classname(self.pipeline.name)
-        # 检查是否有 parametrize 用例（需要 import json）
-        has_negative = any(
+        mode_label = "造数据" if self.data_only else "测试"
+        # 造数据模式不需要 import json（无 parametrize）
+        has_negative = not self.data_only and any(
             any(t.category != "positive" for t in tcs)
             for tcs in self.test_cases_by_step.values()
         )
         imports = [
-            f'"""测试: {self.pipeline.name} — 由 API Test Workbench 导出"""',
+            f'"""测试: {self.pipeline.name} — 由 API Test Workbench 导出（{mode_label}模式）"""',
             '',
             'import pytest',
             'import time',
@@ -460,7 +444,7 @@ def api_headers(env_config):
         for i, step in enumerate(self.pipeline.steps):
             _, path = _parse_url(step.config.url)
             body = step.config.body_template if isinstance(step.config.body_template, dict) else {}
-            is_write = _is_write_step(step)
+            is_write = is_write_step(step)
             if is_write:
                 body = self._dynamize_body(body)
             lines.append(f'')
@@ -483,12 +467,15 @@ def api_headers(env_config):
             lines.append(method)
             lines.append('')
 
-        # 异常用例
-        lines.append('    # ========== 边界值 / 异常用例 ==========')
-        lines.append('')
-        for method in self._gen_negative_parametrize():
-            lines.append(method)
-            lines.append('')
+        # 异常用例（造数据模式跳过）
+        if not self.data_only:
+            neg_methods = self._gen_negative_parametrize()
+            if neg_methods:
+                lines.append('    # ========== 边界值 / 异常用例 ==========')
+                lines.append('')
+                for method in neg_methods:
+                    lines.append(method)
+                    lines.append('')
 
         return '\n'.join(lines)
 
@@ -526,7 +513,7 @@ def api_headers(env_config):
                 )
 
             http_method = step.config.method.lower()
-            is_write = _is_write_step(step)
+            is_write = is_write_step(step)
 
             # 仅写操作追加时间戳动态化代码
             dynamize_block = ""
@@ -576,7 +563,7 @@ def api_headers(env_config):
 
         # 构建 body — 合并 template + input_data（仅写操作对唯一性字段做动态化处理）
         body_dict = self._merge_body(step.config.body_template, tc.input_data)
-        if _is_write_step(step):
+        if is_write_step(step):
             body_dict = self._dynamize_body(body_dict)
 
         # 检查 body 中是否有占位符需替换为 self.stepX_xxx
@@ -770,7 +757,8 @@ def api_headers(env_config):
 
         return '\n'.join(lines) if lines else ""
 
-    def _merge_body(self, template, input_data: dict) -> dict:
+    @staticmethod
+    def _merge_body(template, input_data: dict) -> dict:
         """合并 body_template + input_data"""
         if isinstance(template, list):
             return template
