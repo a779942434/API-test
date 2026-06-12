@@ -23,6 +23,7 @@ from api_test_workbench.engine.runner import (
 )
 from api_test_workbench.engine.bindings import scan_placeholders
 from api_test_workbench.engine.curl_parser import parse_curl
+from api_test_workbench.engine.exporter import PytestExporter, _sanitize_filename
 from api_test_workbench.engine.reporter import generate_html_report, generate_json_report
 from api_test_workbench.engine.environment import (
     init_default_environments, list_environments,
@@ -885,9 +886,40 @@ with st.expander("登录认证", expanded=not st.session_state.auth_ok):
 has_cases = any(len(v) > 0 for v in st.session_state.pipeline_test_cases_by_step.values())
 exec_disabled = not has_cases
 
-exec_col1, _ = st.columns([1, 4])
+exec_col1, exec_col2, _ = st.columns([1, 1, 3])
 with exec_col1:
     run_clicked = st.button("执行 Pipeline", type="primary", use_container_width=True, disabled=exec_disabled)
+with exec_col2:
+    # 导出 pytest 按钮
+    if has_cases:
+        # 使用 expander 避免每次生成 ZIP
+        if st.button("📦 导出 pytest", use_container_width=True, disabled=exec_disabled):
+            try:
+                exporter = PytestExporter(
+                    pipeline=st.session_state.pipeline,
+                    test_cases_by_step=st.session_state.pipeline_test_cases_by_step,
+                    auth_url=st.session_state.get("auth_url", ""),
+                    auth_body=json.loads(st.session_state.get("auth_body", "{}"))
+                        if isinstance(st.session_state.get("auth_body"), str)
+                        else st.session_state.get("auth_body", {}),
+                )
+                zip_bytes = exporter.export_to_zip_bytes()
+                st.session_state["_export_zip"] = zip_bytes
+                st.session_state["_export_name"] = f"pytest_{_sanitize_filename(st.session_state.pipeline.name)}.zip"
+            except Exception as e:
+                st.error(f"导出失败: {e}")
+
+        # 如果已生成 ZIP，显示下载按钮
+        if st.session_state.get("_export_zip"):
+            st.download_button(
+                label="⬇️ 下载 ZIP",
+                data=st.session_state["_export_zip"],
+                file_name=st.session_state.get("_export_name", "pytest_export.zip"),
+                mime="application/zip",
+                use_container_width=True,
+            )
+    else:
+        st.button("📦 导出 pytest", use_container_width=True, disabled=True, help="请先生成测试用例")
 
 if run_clicked:
     if not st.session_state.auth_ok:

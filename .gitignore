@@ -22,3 +22,6 @@ Thumbs.db
 
 # 工作台日志
 workbench.log
+
+# 导出的 pytest 测试（含环境配置，不应提交）
+tests/exported/

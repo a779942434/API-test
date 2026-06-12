@@ -30,18 +30,37 @@ API 响应约定：
 - 业务成功：resp.json()['code'] == '0'
 - 业务失败：resp.json()['code'] != '0'
 - expected_status_code 一律填 200，assertion_logic 用 code 判断业务成败
-- 注意：API 返回的数字字段可能是字符串类型（如 total: "5"），数值比较时需用 int() 转换：
+- **注意：API 返回的 code 字段可能是字符串 "0" 也可能是整数 0，断言必须兼容两种类型**
+  正确: str(resp_json['code']) == '0'
+  错误: resp_json['code'] == '0'（当 code 为整数 0 时断言失败）
+- **注意：API 返回的数字字段可能是字符串类型（如 total: "5"），数值比较时需用 int() 转换**
   正确: int(resp_json['data']['total']) > 0
   错误: resp_json['data']['total'] > 0
+
+## 动态数据生成规则（关键）
+为了保证测试数据的唯一性、避免数据库唯一性约束冲突，input_data 中涉及名称/编码/标识的字段值必须使用动态模式：
+- 字符串值后追加 {timestamp} 占位符，如 "测试刀具A001" → "测试刀具A001_{timestamp}"
+- 编码类字段（articleNumber、code、sparePartCode 等）：使用前缀+时间戳模式，如 "TOOL-001_{timestamp}"
+- 下列模式的值不需要追加时间戳：
+  * 纯数字（如 1、0、200）
+  * 布尔/枚举值（true/false、enableInd=1）
+  * 空字符串 ""
+  * 明确指定的异常测试值（如超长字符串、SQL 注入等边界测试场景）
+- 每个用例的 case_name 应注明是否包含动态值（如 "正向-新增刀具_{timestamp}"）
+
+## 类型安全断言规则
+- 所有涉及 code 字段的比较，必须使用 str() 包裹：str(resp_json['code']) == '0'
+- 数值比较必须使用 int() 转换：int(resp_json.get('data', {}).get('total', 0)) > 0
+- 禁止直接比较而不做类型转换
 
 生成规则：
 1. 覆盖完整 CRUD + 列表查询（含分页、过滤、排序、模糊搜索）
 2. 对每个字段应用：等价类（有效值、无效类型、空值/Null/undefined、特殊字符、超长/超短）、边界值（min, min-1, min+1, max, max-1, max+1）、枚举值（合法枚举、非法枚举、大小写敏感）
 3. 包含业务规则校验：唯一性、必填项、格式（邮箱/手机号/日期）、跨字段逻辑
 4. 测试数据必须真实可用，符合字段类型与约束，避免纯占位符
-5. 每个用例的 assertion_logic 必须具体到字段级（如：resp.json()['code'] == '0'）
+5. 每个用例的 assertion_logic 必须具体到字段级（如：str(resp.json()['code']) == '0'）
 6. 若字段无明确约束，按行业通用规范补充（字符串默认 1-255，数字默认 0-999999）
-7. 用例数量控制在 15-25 条
+7. 用例数量控制在 15-25 条（覆盖核心场景，避免冗余）
 8. 仅输出 JSON，确保可被 json.loads() 直接解析"""
 
 
@@ -101,6 +120,13 @@ PIPELINE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
 - 用户说「保持不变」的字段 → 不要放入 input_data
 - 只有需要变更或随机生成的字段才放入 input_data
 
+**Pipeline 动态数据规则**：
+- 仅对 POST/PUT 创建/更新类步骤使用 {timestamp} 动态模式，避免触发数据库唯一性约束
+  示例: "articleName": "测试刀具_{timestamp}", "articleNumber": "TOOL-{timestamp}"
+- GET/查询/列表/删除类步骤的 input_data 不需要追加时间戳，使用固定测试值即可
+- 后续步骤 input_data 通常为空，通过 data_dependencies 引用上游步骤的返回值
+- 边界值/异常用例的 input_data 中，非测试目标的字段也要追加 {timestamp} 避免意外触发唯一性冲突
+
 **正常数据模式**（用户明确声明「只需正常数据/不需要边界测试」时激活）：
 - 只生成正向真实数据，用于查看接口效果、填充真实业务数据
 - 禁止生成边界值、异常值、空值、特殊字符、SQL注入等测试用例
@@ -156,16 +182,17 @@ Pipeline 整体流程：
 
 要求：
 1. {count_hint}（重要：后续步骤 Step2/3/4... 只生成恰好 1 条用例！因为后续步骤通过 data_dependencies 引用上游数据，每条链路自动对应 Step1 的一条用例，不需要多条）
-2. Step1 的 input_data 用具体数据填充（写死），后续步骤 input_data 留空 {{}}，数据依赖写入 data_dependencies 用 {{{{stepN.response.path}}}} 格式
-3. 每个步骤标注 output_reference 字段
-4. expected_status_code 一律 200，正向 assertion_logic: resp_json['code'] == '0'，反向: resp_json['code'] != '0'
-5. input_data 只放需要变更的字段，Body 模板已有的值不要重复
+2. **动态数据规则**：仅对 POST/PUT 创建/更新类步骤，input_data 中名称/编码字段追加 {{{{timestamp}}}}（如 "articleName": "测试刀具_{{{{timestamp}}}}"）。GET/查询/列表类步骤不需要追加时间戳，使用固定测试值即可
+3. 后续步骤 input_data 留空 {{}}，数据依赖写入 data_dependencies 用 {{{{stepN.response.path}}}} 格式
+4. 每个步骤标注 output_reference 字段
+5. expected_status_code 一律 200，正向 assertion_logic: str(resp_json['code']) == '0'，反向: str(resp_json['code']) != '0'（**必须用 str() 包裹，兼容 code 为整数的情况**）
+6. input_data 只放需要变更的字段，Body 模板已有的值不要重复
 {chr(10)+scope_rule if scope_rule else ""}
 只输出 JSON，不要 Markdown 或额外文字。"""
 
 
 def build_user_prompt(field_requirements: str, api_url: str = "", method: str = "POST") -> str:
-    """根据用户输入的字段定义构造 User Prompt"""
+    """根据用户输入的字段定义构造 User Prompt（单接口模式）"""
     return f"""请根据以下接口字段定义生成测试用例：
 
 接口地址：{api_url}
@@ -173,5 +200,11 @@ def build_user_prompt(field_requirements: str, api_url: str = "", method: str = 
 
 字段定义：
 {field_requirements}
+
+重要要求：
+- 名称/编码类字段的 input_data 值必须使用动态模式：在业务值后追加 {{{{timestamp}}}}（如 "测试刀具_{{{{timestamp}}}}"），确保测试数据唯一性
+- 纯数字、布尔/枚举值、空字符串不需要追加时间戳
+- assertion_logic 中 code 比较必须使用 str() 包裹：str(resp_json['code']) == '0'
+- 数值比较必须使用 int() 转换：int(resp_json.get('data', {{}}).get('total', 0)) > 0
 
 请直接输出 JSON，不要包含任何 Markdown 标记或额外文字。"""
