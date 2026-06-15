@@ -199,7 +199,9 @@ with col_save:
                 st.session_state.get("field_requirements", ""),
                 st.session_state.get("pipeline_test_cases_by_step", {}),
                 st.session_state.get("auth_url", ""),
-                st.session_state.get("auth_body", "{}"),
+                st.session_state.get("auth_username", ""),
+                st.session_state.get("auth_password", ""),
+                st.session_state.get("auth_tenant_id", ""),
                 name=p.name,
             )
             st.success(f"已保存: {len(p.steps)}步, {step_info}")
@@ -230,7 +232,9 @@ if st.session_state.get("_show_load_ui"):
                     st.session_state.field_requirements = data["field_requirements"]
                     st.session_state.pipeline_test_cases_by_step = data["pipeline_test_cases_by_step"]
                     st.session_state.auth_url = data["auth_url"]
-                    st.session_state.auth_body = data["auth_body"]
+                    st.session_state.auth_username = data.get("auth_username", "")
+                    st.session_state.auth_password = data.get("auth_password", "")
+                    st.session_state.auth_tenant_id = data.get("auth_tenant_id", "")
                     st.session_state.pipeline_results = None
                     # 递增所有步骤 widget 版本号 → 强制用新 key 从加载数据重新初始化
                     for k in list(st.session_state.keys()):
@@ -278,7 +282,8 @@ def _init_session_state():
         "pipeline_test_cases_by_step": {},
         "pipeline_results": None,
         "auth_url": "http://bird.ob.shuyilink.com/auth/auth-login",
-        "auth_body": '{"username": "", "password": ""}',
+        "auth_username": "",
+        "auth_password": "",
         "auth_tenant_id": "",
         "auth_session": None,
         "auth_ok": False,
@@ -287,7 +292,6 @@ def _init_session_state():
         "env_variables": {},  # 当前激活环境的变量映射
         "show_env_editor": False,  # 是否打开环境编辑器
         "_default_auth_url": "http://bird.ob.shuyilink.com/auth/auth-login",
-        "_default_auth_body": '{"username": "", "password": ""}',
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -429,27 +433,31 @@ with st.sidebar:
             # 保存当前手动设置的 Auth 配置（用于取消环境时恢复）
             if not st.session_state.active_env:
                 st.session_state._default_auth_url = st.session_state.auth_url
-                st.session_state._default_auth_body = st.session_state.auth_body
+                st.session_state._default_auth_username = st.session_state.auth_username
+                st.session_state._default_auth_password = st.session_state.auth_password
             st.session_state.active_env = env_name
             env_data = next((e for e in envs if e["name"] == env_name), None)
             if env_data:
                 env_vars = dict(env_data.get("variables", {}))
-                # 自动加入 BASE 简写
                 if env_data.get("base_url") and "BASE" not in env_vars:
                     env_vars["BASE"] = env_data["base_url"]
                 st.session_state.env_variables = env_vars
-                # 应用环境的 Auth 配置
                 if env_data.get("auth_endpoint"):
                     st.session_state.auth_url = env_data["auth_endpoint"]
                 if env_data.get("auth_body"):
-                    st.session_state.auth_body = json.dumps(env_data["auth_body"], ensure_ascii=False)
+                    try:
+                        ab = json.loads(env_data["auth_body"]) if isinstance(env_data["auth_body"], str) else env_data["auth_body"]
+                        st.session_state.auth_username = ab.get("username", "")
+                        st.session_state.auth_password = ab.get("password", "")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
                 st.session_state.auth_ok = False
                 st.session_state.auth_session = None
     else:
         if st.session_state.active_env:
-            # 恢复手动设置的 Auth 配置
             st.session_state.auth_url = st.session_state._default_auth_url
-            st.session_state.auth_body = st.session_state._default_auth_body
+            st.session_state.auth_username = st.session_state._default_auth_username
+            st.session_state.auth_password = st.session_state._default_auth_password
             st.session_state.auth_ok = False
             st.session_state.auth_session = None
         st.session_state.active_env = ""
@@ -892,21 +900,27 @@ with tab1:
         c1, c2, c3 = st.columns([3, 2, 1])
         with c1:
             st.text_input("登录接口地址", key="auth_url", placeholder="http://bird.ob.shuyilink.com/auth/auth-login")
-            st.text_input("tenantId（可选，合并到登录 Body）", key="auth_tenant_id", placeholder="留空则不传")
         with c2:
-            st.text_area("登录 Body (JSON)", key="auth_body", height=100)
+            st.text_input("用户名", key="auth_username", placeholder="必填")
+            st.text_input("密码", key="auth_password", type="password", placeholder="必填")
+            st.text_input("tenantId（可选）", key="auth_tenant_id", placeholder="留空则不传")
         with c3:
             st.write("")
             st.write("")
             if st.button("获取 Session", use_container_width=True):
                 try:
-                    auth_body = json.loads(st.session_state.auth_body)
-                    tenant_id = st.session_state.get("auth_tenant_id", "").strip()
-                    session = get_auth_session(st.session_state.auth_url, auth_body, tenant_id=tenant_id)
-                    st.session_state.auth_session = session
-                    st.session_state.auth_ok = True
-                    _normalize_step_urls()
-                    st.success("登录成功（已自动统一所有步骤的 Base URL）")
+                    username = st.session_state.get("auth_username", "").strip()
+                    password = st.session_state.get("auth_password", "").strip()
+                    if not username or not password:
+                        st.error("用户名和密码为必填项")
+                    else:
+                        auth_body = {"username": username, "password": password}
+                        tenant_id = st.session_state.get("auth_tenant_id", "").strip()
+                        session = get_auth_session(st.session_state.auth_url, auth_body, tenant_id=tenant_id)
+                        st.session_state.auth_session = session
+                        st.session_state.auth_ok = True
+                        _normalize_step_urls()
+                        st.success("登录成功（已自动统一所有步骤的 Base URL）")
                 except Exception as e:
                     st.session_state.auth_ok = False
                     st.error(f"登录失败: {e}")
@@ -933,9 +947,8 @@ with tab1:
                         pipeline=st.session_state.pipeline,
                         test_cases_by_step=st.session_state.pipeline_test_cases_by_step,
                         auth_url=st.session_state.get("auth_url", ""),
-                        auth_body=json.loads(st.session_state.get("auth_body", "{}"))
-                            if isinstance(st.session_state.get("auth_body"), str)
-                            else st.session_state.get("auth_body", {}),
+                        auth_body={"username": st.session_state.get("auth_username", ""),
+                                   "password": st.session_state.get("auth_password", "")},
                     )
                     zip_bytes = exporter.export_to_zip_bytes()
                     st.session_state["_export_zip"] = zip_bytes
@@ -1244,9 +1257,8 @@ Body 模板（已有默认值，只需随机化用户指定的字段）：{json.
                             pipeline=st.session_state.pipeline,
                             test_cases_by_step=st.session_state.data_gen_cases,
                             auth_url=st.session_state.get("auth_url", ""),
-                            auth_body=json.loads(st.session_state.get("auth_body", "{}"))
-                                if isinstance(st.session_state.get("auth_body"), str)
-                                else st.session_state.get("auth_body", {}),
+                            auth_body={"username": st.session_state.get("auth_username", ""),
+                                       "password": st.session_state.get("auth_password", "")},
                             data_only=True,
                         )
                         zip_bytes = exporter.export_to_zip_bytes()

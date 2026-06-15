@@ -88,7 +88,8 @@ def _deserialize_test_cases(data: dict) -> dict:
 
 
 def save(pipeline: Pipeline, field_requirements: str,
-         test_cases_by_step: dict, auth_url: str, auth_body: str,
+         test_cases_by_step: dict, auth_url: str,
+         auth_username: str = "", auth_password: str = "", auth_tenant_id: str = "",
          name: str = "") -> str:
     """保存当前工作台状态，返回文件路径"""
     _ensure_dir()
@@ -103,7 +104,9 @@ def save(pipeline: Pipeline, field_requirements: str,
         "field_requirements": field_requirements,
         "pipeline_test_cases_by_step": _serialize_test_cases(test_cases_by_step),
         "auth_url": auth_url,
-        "auth_body": auth_body,
+        "auth_username": auth_username,
+        "auth_password": auth_password,
+        "auth_tenant_id": auth_tenant_id,
     }
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -132,17 +135,32 @@ def list_saves() -> list[dict]:
 
 
 def load(filepath: str) -> Optional[dict]:
-    """加载存档，返回 {pipeline, field_requirements, test_cases_by_step, auth_url, auth_body}"""
+    """加载存档，返回 {pipeline, field_requirements, test_cases_by_step, auth_url, auth_username, auth_password, auth_tenant_id}"""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
 
+    # 兼容旧格式：如果存的是 auth_body JSON 字符串，从中提取 username/password
+    username = data.get("auth_username", "")
+    password = data.get("auth_password", "")
+    if not username and not password:
+        old_body = data.get("auth_body", "")
+        if old_body:
+            try:
+                body = json.loads(old_body) if isinstance(old_body, str) else old_body
+                username = body.get("username", "")
+                password = body.get("password", "")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
     return {
         "pipeline": _deserialize_pipeline(data.get("pipeline", {})),
         "field_requirements": data.get("field_requirements", ""),
         "pipeline_test_cases_by_step": _deserialize_test_cases(data.get("pipeline_test_cases_by_step", {})),
         "auth_url": data.get("auth_url", ""),
-        "auth_body": data.get("auth_body", ""),
+        "auth_username": username,
+        "auth_password": password,
+        "auth_tenant_id": data.get("auth_tenant_id", ""),
     }
