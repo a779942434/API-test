@@ -2,6 +2,25 @@
 
 import json
 
+
+def _extract_keys(obj, prefix="") -> list[str]:
+    """递归提取嵌套 dict/list 的所有字段名路径，不包含值。
+    用于在 prompt 中展示 Body 模板结构时节省 token。
+
+    示例: {"a": 1, "b": {"c": 2}} → ["a", "b.c"]
+    """
+    keys = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            full = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, (dict, list)):
+                keys.extend(_extract_keys(v, full))
+            else:
+                keys.append(full)
+    elif isinstance(obj, list) and obj:
+        keys.extend(_extract_keys(obj[0], prefix))
+    return keys
+
 SYSTEM_PROMPT = """你是一名资深自动化测试专家与数据质量架构师，精通等价类划分、边界值分析、API 契约测试与测试数据工程。
 你的任务是根据用户提供的【接口字段定义】，自动生成高质量、可直接用于自动化测试脚本的测试用例与测试数据。
 
@@ -142,7 +161,17 @@ PIPELINE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
    - **数组长度**：用 {{{{stepN.response.data._count}}}} 获取元素个数
 6. **断言**：code 必须用 str() 包裹（兼容 "0" 和 0），data 可能是字符串、列表或对象，不要直接 .id
 7. **动态字段标记**：只有名称/编码等需要唯一性的字段才在 input_data 值中追加 {{{{timestamp}}}}，
-   静态描述字段（如 description: "正常报修"）不需要追加时间戳，保持原值即可"""
+   静态描述字段（如 description: "正常报修"）不需要追加时间戳，保持原值即可
+8. **精简输出（关键）**：每条用例的 JSON 必须尽量精简，以节省 token 避免截断：
+   - 空字符串字段（pre_condition: "", post_condition: ""）直接省略，不要输出
+   - 空数组字段（expected_response_keys: []）直接省略
+   - 空对象字段（data_dependencies: {}）直接省略
+   - input_data 中值为空的字段也省略
+   - 这样每条用例 JSON 可以从 ~1500 字缩减到 ~500 字
+9. **查询/列表步骤精简**：用户说"传参不变"/"保持不变"的 GET/查询步骤，
+   → input_data 严格为 {{}}，生成 1 条核心用例即可（其余 N-1 条复用同一个 input_data）
+   → 这类步骤的用例不产生 boundary/equivalence/dependency 变体，全部用 positive list
+   → 只有用户明确要求测查询边界时才给查询步骤生成边界用例"""
 
 
 def build_pipeline_user_prompt(
@@ -160,11 +189,13 @@ def build_pipeline_user_prompt(
     steps_block_parts = []
     for i, desc in enumerate(step_descriptions):
         parts = [f"  Step {i+1}：{desc}"]
-        # 附上当前 body_template 作为上下文（让 AI 知道字段名和默认值）
+        # 附上当前 body_template 的字段名（仅 key，不展示完整值以节省 token）
         if i < len(steps):
             bt = steps[i].config.body_template if hasattr(steps[i], 'config') else {}
             if bt:
-                parts.append(f"     当前 Body 默认值（供参考，了解字段名和类型）：{json.dumps(bt, ensure_ascii=False)}")
+                # 只显示字段名列表，减少 prompt token 消耗
+                keys = _extract_keys(bt)
+                parts.append(f"     Body 字段: {', '.join(keys)}")
         steps_block_parts.append("\n".join(parts))
     steps_block = "\n".join(steps_block_parts)
 
@@ -231,6 +262,9 @@ def build_pipeline_user_prompt(
 - 用户说「传参不变」「保持不变」「不修改」「其余传参不变」的步骤
   → input_data 必须严格为 {{}}（空对象），不要把 body_template 中的任何字段放入 input_data
   → 仅用户明确说要修改/随机化/动态生成的字段才放入 input_data
+- **查询/列表步骤精简**：GET/查询步骤，用户说「传参不变」时，
+  → {test_cases_per_step} 条用例全部使用相同的 input_data（{{}}），category 全部为 "positive"
+  → 不需要生成 boundary/equivalence/dependency 变体，这些用例会浪费 token 导致截断
 - 用户说「xxx来源于StepN的yyy」 → 不要放入 input_data，改用 data_dependencies 引用
 - 用户没提到的字段 → 不要放入 input_data，保持 Body 默认值
 
@@ -252,10 +286,10 @@ def build_pipeline_user_prompt(
 - **重要**：只有名称/编码类需要唯一性的字段才追加 {{{{timestamp}}}}，静态描述字段（如 description）不要追加
 - GET/查询步骤不需要时间戳
 - 纯数字、布尔值、空字符串不需要追加
-- **数据多样性（关键）**：每个步骤生成的 {test_cases_per_step} 条用例，其中可变字段必须每条都不同！
-  * 数值字段用不同数值（如 repairQuantity: 1、50、100、500、999，不要 5 条都用 566）
-  * 文本字段每条用不同内容（如 repairReason: "正常磨损"、"定期维护"、"突发故障"...）
-  * 不使用 data_dependencies 引用的静态传参也要适当变化（模拟真实业务场景）
+- **数据多样性**：仅 POST/PUT 写操作步骤需要多样性！
+  * 查询步骤（GET/传参不变）：{test_cases_per_step} 条用例 input_data 全部相同（{{}} 或相同值），不产生变体
+  * 写操作步骤：可变字段每条不同（数值: 1/50/100/500/999，文本: "正常磨损"/"定期维护"/"突发故障"）
+- **JSON 精简**：每条用例省略空字符串("")、空数组([])、空对象({{}})，只输出有实际内容的字段
 
 {boundary_section}
 ## 其他要求
