@@ -89,27 +89,73 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_con
     # 剥离 AI 残留占位符
     assertion_logic = strip_placeholders(assertion_logic)
 
+    # 剥离 assert 关键字（AI 可能误写 assert xxx，实际只需布尔表达式）
+    assertion_logic = re.sub(r'^assert\s+', '', assertion_logic.strip())
+
+    # 修复：data 字段不一定存在，直接检查 len(str(.get('data',''))) > 0 在无 data 时必然失败
+    # → 追加 'data' not in resp_json or 前缀，使无 data 的响应也能通过
+    assertion_logic = re.sub(
+        r"len\(str\((\w+)\.get\('data',\s*['\"]{2}\)\)\)\s*>\s*0",
+        r"('data' not in \1 or len(str(\1.get('data', ''))) > 0)",
+        assertion_logic,
+    )
+
     # 安全转换：将 data 字段的 .get() 转为防御式，兼容 data 为字符串（直接返回 ID）、
     # 为 dict（对象）、为 None 三种情况
     # resp_json.get('data', {}).get('id', 0) → safe_get(resp_json, 'data', 'id', 0)
     # 规则：如果 data 是字符串 → 它就是 ID；如果是 dict → 取其 .id
-    def _safe_get(data, key, default=0):
-        if isinstance(data, dict):
-            return data.get(key, default)
-        if isinstance(data, str):
-            return int(data) if key == 'id' else default
+    def _safe_get(data, parent_key, child_key, default=0):
+        parent = data.get(parent_key) if isinstance(data, dict) else data
+        if isinstance(parent, dict):
+            return parent.get(child_key, default)
+        if isinstance(parent, list):
+            # data 字段是数组时，取第一个元素的 child_key
+            if parent and isinstance(parent[0], dict):
+                return parent[0].get(child_key, default)
+            return default
+        if isinstance(parent, str):
+            return int(parent) if child_key == 'id' else default
         return default
 
-    safe_context_extra = {"safe_get": _safe_get}
+    def _as_dict(val):
+        """安全转换为 dict，非 dict 类型（如 list/str/None）返回空 dict。
+        防止 list.get('records', []) 导致的 AttributeError。
+        """
+        return val if isinstance(val, dict) else {}
+
+    # 单引号版：双层 .get('data', {}).get('id', 0) → safe_get(...)
     assertion_logic = re.sub(
         r"(\w+)\.get\('(\w+)',\s*\{\}\)\.get\('(\w+)',\s*(\d+)\)",
         r"safe_get(\1, '\2', '\3', \4)",
         assertion_logic,
     )
-    # 简化版：单层 .get('data', {}) 也保护
+    # 双引号版（P1#9）
+    assertion_logic = re.sub(
+        r'(\w+)\.get\("(\w+)",\s*\{\}\)\.get\("(\w+)",\s*(\d+)\)',
+        r'safe_get(\1, "\2", "\3", \4)',
+        assertion_logic,
+    )
+    # 简化版：单层 .get('data', {}) → _as_dict() 防御 list/dict/str 三种类型
     assertion_logic = re.sub(
         r"(\w+)\.get\('(\w+)',\s*\{\}\)",
-        r"(\1.get('\2') or {})",
+        r"_as_dict(\1.get('\2'))",
+        assertion_logic,
+    )
+    assertion_logic = re.sub(
+        r'(\w+)\.get\("(\w+)",\s*\{\}\)',
+        r'_as_dict(\1.get("\2"))',
+        assertion_logic,
+    )
+    # 修复历史遗留：已存在的 (resp_json.get('data') or {}).get(...) 模式
+    # → _as_dict(resp_json.get('data')).get(...)
+    assertion_logic = re.sub(
+        r"\((\w+)\.get\('(\w+)'\)\s+or\s+\{\}\)\.get\(",
+        r"_as_dict(\1.get('\2')).get(",
+        assertion_logic,
+    )
+    assertion_logic = re.sub(
+        r'\((\w+)\.get\("(\w+)"\)\s+or\s+\{\}\)\.get\(',
+        r'_as_dict(\1.get("\2")).get(',
         assertion_logic,
     )
 
@@ -134,11 +180,15 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_con
         "int": int,
         "bool": bool,
         "len": len,
+        "isinstance": isinstance,
+        "list": list,
+        "dict": dict,
         "in": lambda a, b: a in b,
         "True": True,
         "False": False,
         "None": None,
         "safe_get": _safe_get,
+        "_as_dict": _as_dict,
     }
 
     # 注入上游步骤数据：step1, step2, ...（1-based，匹配占位符习惯）
@@ -151,13 +201,13 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_con
         result = eval(assertion_logic, {"__builtins__": {}}, safe_context)
         if result:
             return True, ""
-        return False, f"断言失败: {assertion_logic}"
+        return False, f"断言失败: {assertion_logic}（响应code={resp_json.get('code')}）"
     except Exception as e:
         # 断言执行异常（如 data 字段是字符串而非对象导致 .get() 失败）
         # 这不影响测试结果——断言失败就是 FAIL
         hint = ""
         if "object has no attribute 'get'" in str(e) or "AttributeError" in str(type(e).__name__):
-            hint = "（可能原因：API 返回的 data 字段不是对象类型，请用 (resp_json.get('data') or {}) 防御）"
+            hint = "（可能原因：API 返回的 data 字段是 list 而非 dict，请用 _as_dict(resp_json.get('data')) 防御）"
         return False, f"断言执行异常 [{type(e).__name__}]: {e}\n{hint}\n断言: {assertion_logic}"
 
 
@@ -252,11 +302,26 @@ def run_single_test(
         # 验证状态码
         passed = resp.status_code == tc.expected_status_code
 
+        # P1#8: 检测 401 可能为 Token 过期
+        if resp.status_code == 401:
+            log.warning("收到 401 Unauthorized — 可能 Token 已过期，建议重新登录")
+
         # 如果状态码通过，执行附加断言
         assertion_error = ""
         if passed and tc.assertion_logic:
             assertion_passed, assertion_error = _safe_eval_assertion(tc.assertion_logic, resp, step_context)
             passed = assertion_passed
+
+        # 验证预期响应键（P0#3: expected_response_keys 校验）
+        if passed and tc.expected_response_keys:
+            resp_json = response_json if isinstance(response_json, dict) else {}
+            missing_keys = [k for k in tc.expected_response_keys if k not in resp_json]
+            if missing_keys:
+                passed = False
+                assertion_error = (
+                    f"响应缺少预期键: {missing_keys}，"
+                    f"实际键: {list(resp_json.keys())[:20]}"
+                )
 
         return TestResult(
             case_id=tc.case_id,
@@ -423,6 +488,9 @@ def execute_pipeline(
                     actual_status_code=0, expected_status_code=0, response_body=None,
                     response_time_ms=0.0,
                 ))
+                # P1#10: 填充空上下文，避免下游步骤的占位符引用时报 ValueError
+                context.extracted_values[step_idx] = {}
+                log.debug("Step %d 已忽略，填充空上下文", step_idx + 1)
                 continue
 
             step_tcs = test_cases_by_step.get(step_idx, [])
@@ -477,6 +545,11 @@ def execute_pipeline(
                 # 提取响应数据给下游步骤（断言失败时也提取，因为业务失败不代表没数据）
                 if isinstance(result.response_body, dict):
                     context.extracted_values[step_idx] = _flatten_response(result.response_body)
+                elif isinstance(result.response_body, list):
+                    # P0#4: JSON 数组响应保留结构化路径，如 response[0].id
+                    context.extracted_values[step_idx] = _flatten_response(
+                        result.response_body, "response"
+                    )
                 elif result.response_body is not None:
                     context.extracted_values[step_idx] = {"response.raw": str(result.response_body)[:200]}
                 else:

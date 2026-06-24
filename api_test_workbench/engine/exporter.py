@@ -148,8 +148,12 @@ def _build_safe_extract(path: str, var_name: str, indent: int = 8) -> str:
 def _convert_assertion(assertion_logic: str) -> str:
     """将 sandbox eval 断言转为类型安全的原生 pytest assert
 
-    关键转换: resp_json['code'] == '0' → str(result.get('code')) == '0'
-    这样无论后端返回 '0'(str) 还是 0(int) 都能正确断言。
+    关键转换:
+    - resp_json['code'] == '0' → str(result.get('code')) == '0'
+    - resp_json['code'] != '0' → str(result.get('code')) != '0'
+    - 双层 .get('data',{}).get('id',0) → _safe_get(result, 'data', 'id', 0)
+    这样无论后端返回 '0'(str) 还是 0(int) 都能正确断言，
+    且 data 为字符串/对象/null 均安全。
     """
     if not assertion_logic or not assertion_logic.strip():
         return "pass  # 无断言"
@@ -159,14 +163,28 @@ def _convert_assertion(assertion_logic: str) -> str:
     # resp_json['key'] → result.get('key')
     expr = re.sub(r"resp_json\['([^']+)'\]", r"result.get('\1')", expr)
     expr = re.sub(r'resp_json\["([^"]+)"\]', r'result.get("\1")', expr)
-    expr = expr.replace('resp_json', 'result')
+    expr = re.sub(r'\bresp_json\b', 'result', expr)
     # status_code → resp.status_code
     expr = re.sub(r'\bstatus_code\b', 'resp.status_code', expr)
     # json['key'] → result.get('key')
     expr = re.sub(r"\bjson\['([^']+)'\]", r"result.get('\1')", expr)
     expr = re.sub(r'\bjson\["([^"]+)"\]', r'result.get("\1")', expr)
 
-    # 类型安全: code 字段的比较必须兼容 str 和 int
+    # ── 类型安全：双层 .get('data', {}).get('key', default) → _safe_get(result, 'data', 'key', default) ──
+    # 单引号版（default 匹配任意非 ) 字符，支持负数、字符串、变量等）
+    expr = re.sub(
+        r"result\.get\('(\w+)',\s*\{\}\)\.get\('(\w+)',\s*([^)]+)\)",
+        r"_safe_get(result, '\1', '\2', \3)",
+        expr,
+    )
+    # 双引号版
+    expr = re.sub(
+        r'result\.get\("(\w+)",\s*\{\}\)\.get\("(\w+)",\s*([^)]+)\)',
+        r'_safe_get(result, "\1", "\2", \3)',
+        expr,
+    )
+
+    # ── 类型安全：code 字段的比较必须兼容 str 和 int ──
     # result.get('code') == '0' → str(result.get('code')) == '0'
     expr = re.sub(
         r"result\.get\('code'\)\s*==\s*'(\d+)'",
@@ -176,6 +194,17 @@ def _convert_assertion(assertion_logic: str) -> str:
     expr = re.sub(
         r'result\.get\("code"\)\s*==\s*"(\d+)"',
         r'str(result.get("code")) == "\1"',
+        expr,
+    )
+    # result.get('code') != '0' → str(result.get('code')) != '0'  ← P0#1 修复
+    expr = re.sub(
+        r"result\.get\('code'\)\s*!=\s*'(\d+)'",
+        r"str(result.get('code')) != '\1'",
+        expr,
+    )
+    expr = re.sub(
+        r'result\.get\("code"\)\s*!=\s*"(\d+)"',
+        r'str(result.get("code")) != "\1"',
         expr,
     )
 
@@ -424,6 +453,16 @@ def api_headers(env_config):
             f'    """Pipeline: {self.pipeline.name}"""',
             '',
             '    TS = int(time.time())',
+            '',
+            '    @staticmethod',
+            '    def _safe_get(result, parent_key, child_key, default=0):',
+            '        """安全获取嵌套字段，兼容 data 为字符串/对象/null 三种类型"""',
+            '        data = result.get(parent_key) if isinstance(result, dict) else None',
+            '        if isinstance(data, dict):',
+            '            return data.get(child_key, default)',
+            '        if isinstance(data, str):',
+            '            return int(data) if child_key == "id" else default',
+            '        return default',
             '',
         ]
 

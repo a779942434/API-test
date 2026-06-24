@@ -31,9 +31,13 @@ API 响应约定：
 - 业务失败：str(resp_json['code']) != '0'
 - expected_status_code 一律填 200，assertion_logic 用 code 判断业务成败
 - **注意：API 返回的 code 字段可能是字符串 "0" 也可能是整数 0，断言必须用 str() 兼容**
-- **注意：新增/编辑接口返回的 data 可能是字符串（直接返回 ID，如 "20653..."）也可能是对象 {id: xxx}，
-  断言 data 存在即可：len(str(resp_json.get('data', ''))) > 0
-  不要用 resp_json['data']['id'] 这种写法——data 是字符串时会报错**
+- **重要：data 字段是可选的，不是所有接口都返回 data 字段！**
+  * 查询/列表接口可能返回 data 数组或 data.records 对象，也可能不返回 data（只有 code + message）
+  * 新增/编辑接口返回的 data 可能是字符串（直接返回 ID）也可能是对象 {id: xxx}
+  * **基本断言只需 str(resp_json['code']) == '0'，不要强制检查 data 是否存在**
+  * 只有当用户明确要求校验返回数据时，才追加 data 相关的断言
+  * 如果需要校验 data：先用 'data' in resp_json 判断是否存在，再根据类型校验
+    正确写法：str(resp_json['code']) == '0' and ('data' not in resp_json or len(str(resp_json.get('data', ''))) > 0)
 
 ## 动态数据生成规则（关键）
 为了保证测试数据的唯一性、避免数据库唯一性约束冲突，input_data 中涉及名称/编码/标识的字段值必须使用动态模式：
@@ -44,15 +48,35 @@ API 响应约定：
   * 布尔/枚举值（true/false、enableInd=1）
   * 空字符串 ""
   * 明确指定的异常测试值（如超长字符串、SQL 注入等边界测试场景）
+  * **格式敏感字段**：字段名包含 date/time/phone/email/mobile/url/mail 的字段不追加时间戳（如 effectiveDate: "2025-01-01" 保持不变）
 - 每个用例的 case_name 应注明是否包含动态值（如 "正向-新增刀具_{timestamp}"）
 
 ## 类型安全断言规则
 - 所有涉及 code 字段的比较，必须使用 str() 包裹：str(resp_json['code']) == '0'
-- **data 字段可能有两种类型**：对象 {id: xxx} 或直接返回 ID 字符串 "xxx"
-  新增接口的 data 通常直接是 ID 字符串，断言 data 存在即可：len(str(resp_json.get('data', ''))) > 0
-  如果是对象类型，用 safe_get 防御：safe_get(resp_json, 'data', 'id', 0) > 0
+- **data 字段可能有三种类型**：对象 {id: xxx}、数组 [...]、或直接返回 ID 字符串 "xxx"
+  正确断言模板：
+  ```python
+  data_val = resp_json.get('data')
+  if isinstance(data_val, list):
+      # data 是数组：直接判断长度
+      assert len(data_val) > 0, "data 数组不应为空"
+  elif isinstance(data_val, dict):
+      # data 是对象：判断 records 或 id
+      assert len(data_val.get('records', data_val.get('items', []))) > 0
+  elif isinstance(data_val, str):
+      # data 是字符串（直接返回 ID）
+      assert len(data_val) > 0
+  else:
+      assert False, "data 类型异常"
+  ```
+  简单版本（只用 _as_dict 防御）：`len(_as_dict(resp_json.get('data')).get('records', [])) > 0`
+  （_as_dict 会自动把 list/str/None 转成空 dict {}，防止 .get() 崩溃）
+  不要用 len(str(data)) > 0 —— 空对象 {} 转 str 为 "{}" 长度 2，断言永远为 True
+  如果是对象类型取 id：safe_get(resp_json, 'data', 'id', 0) > 0
 - 数值比较必须使用 int() 转换
 - 禁止直接比较而不做类型转换
+- **断言可用内置函数**：str, int, bool, len, isinstance, list, dict, True, False, None, safe_get, _as_dict
+  （注意：assert 关键字不可用，直接写布尔表达式即可）
 
 生成规则：
 1. 覆盖完整 CRUD + 列表查询（含分页、过滤、排序、模糊搜索）
@@ -71,7 +95,7 @@ PIPELINE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
 
 ## Pipeline 模式（多步骤 API 链路测试）
 
-你现在为多步骤 API Pipeline 生成测试用例。每个步骤是独立的 API 接口，前一步的输出是后一步的输入。
+你现在为多步骤 API Pipeline 生成测试用例。每个步骤是独立的 API 接口，前一步的输出是后一步的输入（步骤间通过 data_dependencies 传递数据）。
 
 输出结构（Pipeline 模式）：
 {
@@ -98,40 +122,21 @@ PIPELINE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
           }
         }
       ],
-      "output_reference": "data.id"
+      "output_reference": "data.records[0].id"
     }
   ]
 }
 
-数据链路规则：
-1. **占位符格式**：{{step1.response.data.id}} = Step1 返回体中 data.id 的值（步骤编号从 1 开始）
-2. 占位符可用于 URL、Body、Headers 任意位置
-3. 每个步骤标注 output_reference（如 data.id），标识传给下游的字段
-
-**自然语言 → 占位符翻译**：
-用户用自然语言描述依赖，你提取其中的 JSON 路径并翻译，常见模式：
-- 「取 Step1 返回的 data.id」 → {{step1.response.data.id}}
-- 「用 Step1 返回的 data.records[0].id」 → {{step1.response.data.records[0].id}}
-- 「id 来自 Step2 的 data.id」 → {{step2.response.data.id}}
-翻译方法：找到用户描述的路径（如 data.id），加上 stepN.response. 前缀，用 {{{{ }}}} 包裹。
-
-**input_data 与 body_template 合并规则**：
-- 最终请求体 = {{**body_template, **input_data}}
-- input_data 的字段会覆盖 body_template 同名字段
-- 用户说「保持不变」的字段 → 不要放入 input_data
-- 只有需要变更或随机生成的字段才放入 input_data
-
-**Pipeline 动态数据规则**：
-- 仅对 POST/PUT 创建/更新类步骤使用 {timestamp} 动态模式，避免触发数据库唯一性约束
-  示例: "articleName": "测试刀具_{timestamp}", "articleNumber": "TOOL-{timestamp}"
-- GET/查询/列表/删除类步骤的 input_data 不需要追加时间戳，使用固定测试值即可
-- 后续步骤 input_data 通常为空，通过 data_dependencies 引用上游步骤的返回值
-- 边界值/异常用例的 input_data 中，非测试目标的字段也要追加 {timestamp} 避免意外触发唯一性冲突
-
-**正常数据模式**（用户明确声明「只需正常数据/不需要边界测试」时激活）：
-- 只生成正向真实数据，用于查看接口效果、填充真实业务数据
-- 禁止生成边界值、异常值、空值、特殊字符、SQL注入等测试用例
-- 每条用例的 input_data 填入真实可用的业务数据，不要故意构造边界场景"""
+核心规则：
+1. **用户描述是最高优先级**：用户说不变的字段不要放入 input_data，用户说要变的才放
+2. **input_data 与 body_template 合并**：最终请求体 = {**body_template, **input_data}，input_data 的同名字段覆盖 body_template
+3. **步骤间数据传递**：用 data_dependencies + {{stepN.response.path}} 占位符，不要放入 input_data
+4. **唯一性**：POST/PUT 的名称/编码字段追加 {timestamp}；GET/查询固定值；纯数字/布尔/空值不加
+5. **响应结构适配**：API 的 data 字段可能是数组 [...] 或对象 {records:[...]}
+   - data 为数组时占位符用 {{{{stepN.response.data[0].id}}}}，断言用 isinstance(data_val, list) 判断
+   - data 为对象时占位符用 {{{{stepN.response.data.records[0].id}}}}，断言用 .get('records',[])
+   - 运行时如果占位符路径未精确匹配，会自动尝试回退路径（移除中间包装段如 records/list/items）
+6. **断言**：code 必须用 str() 包裹（兼容 "0" 和 0），data 可能是字符串、列表或对象，不要直接 .id"""
 
 
 def build_pipeline_user_prompt(
@@ -140,16 +145,20 @@ def build_pipeline_user_prompt(
     steps: list,
     test_cases_per_step: int = 1,
 ) -> str:
-    """构造 Pipeline 模式的 User Prompt"""
+    """构造 Pipeline 模式的 User Prompt
+
+    设计原则：用户描述是最高优先级。本提示词只定义输出格式和必要语法，
+    不覆盖用户对字段变更/不变更的意图。
+    """
 
     steps_block_parts = []
     for i, desc in enumerate(step_descriptions):
         parts = [f"  Step {i+1}：{desc}"]
-        # 附上当前 body_template，让 AI 知道哪些字段已有值
+        # 附上当前 body_template 作为上下文（让 AI 知道字段名和默认值）
         if i < len(steps):
             bt = steps[i].config.body_template if hasattr(steps[i], 'config') else {}
             if bt:
-                parts.append(f"     Body 模板（已有值，input_data 不要重复这些不需要变的字段）：{json.dumps(bt, ensure_ascii=False)}")
+                parts.append(f"     当前 Body 默认值（供参考，了解字段名和类型）：{json.dumps(bt, ensure_ascii=False)}")
         steps_block_parts.append("\n".join(parts))
     steps_block = "\n".join(steps_block_parts)
 
@@ -161,34 +170,75 @@ def build_pipeline_user_prompt(
     ])
 
     if normal_only:
-        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条**正常正向数据**"
-        scope_rule = "只生成正向真实数据，用于查看接口效果。禁止生成边界值、异常值、空值、超长/超短、SQL注入等测试用例。每条用例的 input_data 填入真实可用的业务数据"
+        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条正常正向数据"
+        scope_rule = "只生成正向真实数据。禁止边界值、异常值、空值、超长/超短、SQL注入等测试用例。"
     elif test_cases_per_step <= 1:
         count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条正向核心用例"
-        scope_rule = "只聚焦核心数据链路"
+        scope_rule = ""
     elif test_cases_per_step <= 5:
-        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条，分配：1 正向 + 1-2 边界值 + 剩余异常场景"
+        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条用例，按「边界值覆盖分配规则」严格分配：1条正向 + 剩余覆盖各字段边界（必填/上限/格式）。每条的可变字段值必须不同！"
         scope_rule = ""
     else:
-        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条，全面覆盖：正向/等价类/边界值/异常/跨字段依赖"
+        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条用例，按「边界值覆盖分配规则」分配：正向 + 各字段边界 + 异常 + 等价类。全面覆盖！"
         scope_rule = ""
 
-    return f"""请根据以下 API Pipeline 描述生成多步骤测试用例。
+    return f"""请根据用户的 Pipeline 描述生成多步骤测试用例。
 
-Pipeline 整体流程：
+## 用户需求（最高优先级，必须严格遵循）
 {pipeline_description}
 
-步骤定义（含 Body 模板，input_data 不要重复其中已有的字段）：
+## 步骤定义
 {steps_block}
 
-要求：
-1. {count_hint}（重要：后续步骤 Step2/3/4... 只生成恰好 1 条用例！因为后续步骤通过 data_dependencies 引用上游数据，每条链路自动对应 Step1 的一条用例，不需要多条）
-2. **动态数据规则**：仅对 POST/PUT 创建/更新类步骤，input_data 中名称/编码字段追加 {{{{timestamp}}}}（如 "articleName": "测试刀具_{{{{timestamp}}}}"）。GET/查询/列表类步骤不需要追加时间戳，使用固定测试值即可
-3. 后续步骤 input_data 留空 {{}}，数据依赖写入 data_dependencies 用 {{{{stepN.response.path}}}} 格式
-4. 每个步骤标注 output_reference 字段
-5. expected_status_code 一律 200，正向 assertion_logic: str(resp_json['code']) == '0'，反向: str(resp_json['code']) != '0'（**必须用 str() 包裹，兼容 code 为整数的情况**）
-6. input_data 只放需要变更的字段，Body 模板已有的值不要重复
-{chr(10)+scope_rule if scope_rule else ""}
+## 如何判断 input_data 放什么（按用户描述决定）
+- 用户说「传参不变」「保持不变」「不修改」「其余传参不变」的步骤
+  → input_data 必须严格为 {{}}（空对象），不要把 body_template 中的任何字段放入 input_data
+  → 仅用户明确说要修改/随机化/动态生成的字段才放入 input_data
+- 用户说「xxx来源于StepN的yyy」 → 不要放入 input_data，改用 data_dependencies 引用
+- 用户没提到的字段 → 不要放入 input_data，保持 Body 默认值
+
+## 步骤间数据传递
+- 用 data_dependencies 字段，占位符格式：{{{{stepN.response.路径}}}}
+- 自然语言 → 占位符翻译示例：
+  「sparePartId来源于step1随机获取的id」
+    → 若 data 为数组：[...] → data_dependencies.body 中用 {{{{step1.response.data[0].id}}}}
+    → 若 data 为对象：{{records:[...]}} → data_dependencies.body 中用 {{{{step1.response.data.records[0].id}}}}
+  「取 Step2 返回的 data.id」→ {{{{step2.response.data.id}}}}
+
+## 动态数据规则
+- 仅 POST/PUT 步骤需要追加 {{{{timestamp}}}} 保证唯一性（如 "刀具名称_{{{{timestamp}}}}"）
+- GET/查询步骤不需要时间戳
+- 纯数字、布尔值、空字符串不需要追加
+- **数据多样性（关键）**：每个步骤生成的 {test_cases_per_step} 条用例，其中可变字段必须每条都不同！
+  * 数值字段用不同数值（如 repairQuantity: 1、50、100、500、999，不要 5 条都用 566）
+  * 文本字段每条用不同内容（如 repairReason: "正常磨损"、"定期维护"、"突发故障"...）
+  * 不使用 data_dependencies 引用的静态传参也要适当变化（模拟真实业务场景）
+
+## 边界值覆盖分配规则（关键）
+用户描述的每个字段约束（必填/上限/下限等）都必须有对应的边界测试用例。
+将 {test_cases_per_step} 条用例按以下优先级分配，确保每个有约束的字段都被覆盖：
+1. **1 条正向全字段正常值**：所有字段使用合法范围内的典型值
+2. **必填字段边界**：必填字段测缺失/空值/非法类型；数值字段测 0、负数、极大值
+3. **字符串上限字段边界**：每个有字符上限的字段各占 1 条 → 测等于上限（max）、超过上限（max+1）
+   - 例：repairReason 上限100字 → 1条测 100 字、下一条测 101 字
+   - 例：repairContent 上限200字 → 1条测 200 字
+   - 字段多的，合并到同一条用例中（一条用例可同时测多个字段边界）
+4. **异常/非法值**：非法枚举、特殊字符、SQL注入等
+5. **剩余配额**：补充其他等价类或组合边界场景
+
+**注意**：如果 {test_cases_per_step} 条不够覆盖所有字段边界，优先覆盖强约束字段（必填 > 上限 > 格式），并在 case_name 中注明「组合边界」。
+
+## 其他要求
+- {count_hint}
+- **重要：每个步骤都要生成恰好 {test_cases_per_step} 条不同的用例！后续步骤也是 {test_cases_per_step} 条！不要只给 Step2+ 生成 1 条！**
+- 每个步骤在 test_cases 同级标注 "output_reference"（如 "data[0].id"）
+- expected_status_code 一律 200
+- 正向断言: str(resp_json['code']) == '0'（基本断言，不要强制追加 data 校验）
+- 反向/异常断言: str(resp_json['code']) != '0'（**必须用 str() 包裹，兼容 code 为整数的情况**）
+- 断言必须用 str() 包裹 code，兼容 code 为字符串或整数的情况
+- data 字段是可选的不一定存在！只有用户明确要求校验返回值时才追加 data 断言
+- 断言中可用 isinstance/list/dict 判断 data 类型，也可用 _as_dict() 防御非 dict 类型
+{chr(10) + scope_rule if scope_rule else ""}
 只输出 JSON，不要 Markdown 或额外文字。"""
 
 

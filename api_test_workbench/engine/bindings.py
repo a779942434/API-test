@@ -1,9 +1,12 @@
 """数据绑定引擎 — 占位符解析 + 数据提取 + 依赖扫描"""
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 from api_test_workbench.engine.models import DataBinding, PipelineContext
+from api_test_workbench.engine.logger import setup_logger
+
+log = setup_logger("bindings")
 
 # 匹配 {{stepN.response.path.to.field}} 或 {{stepN.data.id}}
 _STEP_PLACEHOLDER_RE = re.compile(r'\{\{step(\d+)\.(.+?)\}\}')
@@ -33,8 +36,10 @@ def extract_value(data: dict, path: str) -> Any:
     return current
 
 
-def _flatten_response(data: dict, prefix: str = "response") -> dict[str, Any]:
+def _flatten_response(data, prefix: str = "response") -> dict[str, Any]:
     """将嵌套 JSON 响应扁平化为单层 dict（点号 key），并自动生成数组别名。
+
+    支持 dict 和 list 类型的顶层数据。
 
     返回示例：
         {"response.code": "0", "response.data[0].id": 123, "response.data.id": 123}
@@ -56,16 +61,83 @@ def _flatten_response(data: dict, prefix: str = "response") -> dict[str, Any]:
 
     # 生成数组别名：response.data[0].id → response.data.id
     aliases = {}
-    import re as _re
     for key in list(result.keys()):
-        m = _re.match(r'^(.+)\[0\](.*)$', key)
+        m = re.match(r'^(.+)\[0\](.*)$', key)
         if m:
             alias = m.group(1) + m.group(2)  # 去掉 [0]
             if alias not in result:
                 aliases[alias] = result[key]
     result.update(aliases)
 
+    # 生成常见包装名别名：response.data[0].id → response.data.records[0].id
+    # 当 API 返回 data 为数组但 AI 误加 records/list/items 包装段时，仍能精确匹配
+    wrapper_aliases = {}
+    for key in list(result.keys()):
+        m = re.match(r'^(.+)\[0\](.*)$', key)
+        if m:
+            prefix = m.group(1)
+            suffix = m.group(2)
+            for wrapper in ('records', 'list', 'items'):
+                alias = f"{prefix}.{wrapper}[0]{suffix}"
+                if alias not in result and alias not in wrapper_aliases:
+                    wrapper_aliases[alias] = result[key]
+    result.update(wrapper_aliases)
+
     return result
+
+
+def _segments_to_path(segments: list[str]) -> str:
+    """将段列表还原为点号+数组索引路径。
+
+    例如 ['response', 'data', '0', 'id'] → 'response.data[0].id'
+    """
+    if not segments:
+        return ""
+    result = segments[0]
+    for seg in segments[1:]:
+        if seg.isdigit() or (seg.startswith('-') and seg[1:].isdigit()):
+            result += f"[{seg}]"
+        else:
+            result += f".{seg}"
+    return result
+
+
+def _try_fallback_path(path: str, step_data: dict[str, Any]) -> Optional[str]:
+    """当精确路径未在扁平化数据中找到时，尝试通过移除包装段来匹配。
+
+    例如 API 返回 data 为数组时，_flatten_response 生成 response.data[0].id，
+    但 AI 可能生成 response.data.records[0].id（假设 {records:[...]} 包装）。
+    此函数尝试移除 records/list/items 等中间段来找到匹配。
+
+    Args:
+        path: 原始路径，如 'response.data.records[0].id'
+        step_data: 扁平化后的步骤数据 dict
+
+    Returns:
+        匹配的回退路径，或 None
+    """
+    segments = re.findall(r'[^.\[\]]+|(?<=\[)\d+(?=\])', path)
+    if len(segments) <= 2:
+        return None
+
+    # 常见包装段名称（AI 可能误加的中间段）
+    WRAPPER_NAMES = {'records', 'list', 'items', 'data', 'result', 'content', 'body'}
+
+    for i, seg in enumerate(segments):
+        # 跳过数字索引、response 前缀、以及不在包装名集合中的段
+        if seg.isdigit() or seg == 'response':
+            continue
+        if seg not in WRAPPER_NAMES and not seg.endswith('s'):
+            continue
+
+        # 尝试移除这个段
+        test_segments = segments[:i] + segments[i + 1:]
+        test_path = _segments_to_path(test_segments)
+        if test_path in step_data:
+            log.debug("路径 '%s' 未找到，回退到 '%s'（移除包装段 '%s'）", path, test_path, seg)
+            return test_path
+
+    return None
 
 
 def resolve_placeholders(template: Any, context: PipelineContext) -> Any:
@@ -91,6 +163,11 @@ def resolve_placeholders(template: Any, context: PipelineContext) -> Any:
 
             if path in step_data:
                 return str(step_data[path])
+
+            # 尝试回退路径（处理 AI 生成路径与实际响应结构不匹配的情况）
+            fallback = _try_fallback_path(path, step_data)
+            if fallback is not None:
+                return str(step_data[fallback])
 
             raise KeyError(
                 f"Cannot resolve '{m.group(0)}': path '{path}' "
