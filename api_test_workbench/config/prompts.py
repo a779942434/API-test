@@ -75,8 +75,9 @@ API 响应约定：
   如果是对象类型取 id：safe_get(resp_json, 'data', 'id', 0) > 0
 - 数值比较必须使用 int() 转换
 - 禁止直接比较而不做类型转换
-- **断言可用内置函数**：str, int, bool, len, isinstance, list, dict, True, False, None, safe_get, _as_dict
-  （注意：assert 关键字不可用，直接写布尔表达式即可）
+- **断言可用内置函数**：str, int, float, bool, len, isinstance, list, dict, tuple,
+      min, max, abs, round, sum, any, all, True, False, None, safe_get, _as_dict
+      （注意：assert 关键字不可用，直接写布尔表达式即可）
 
 生成规则：
 1. 覆盖完整 CRUD + 列表查询（含分页、过滤、排序、模糊搜索）
@@ -136,7 +137,12 @@ PIPELINE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
    - data 为数组时占位符用 {{{{stepN.response.data[0].id}}}}，断言用 isinstance(data_val, list) 判断
    - data 为对象时占位符用 {{{{stepN.response.data.records[0].id}}}}，断言用 .get('records',[])
    - 运行时如果占位符路径未精确匹配，会自动尝试回退路径（移除中间包装段如 records/list/items）
-6. **断言**：code 必须用 str() 包裹（兼容 "0" 和 0），data 可能是字符串、列表或对象，不要直接 .id"""
+   - **随机获取**：用 {{{{stepN.response.data.random.id}}}} 每次随机选取一个元素
+   - **指定位置**：用 {{{{stepN.response.data[2].id}}}} 获取第 3 个元素
+   - **数组长度**：用 {{{{stepN.response.data._count}}}} 获取元素个数
+6. **断言**：code 必须用 str() 包裹（兼容 "0" 和 0），data 可能是字符串、列表或对象，不要直接 .id
+7. **动态字段标记**：只有名称/编码等需要唯一性的字段才在 input_data 值中追加 {{{{timestamp}}}}，
+   静态描述字段（如 description: "正常报修"）不需要追加时间戳，保持原值即可"""
 
 
 def build_pipeline_user_prompt(
@@ -172,15 +178,46 @@ def build_pipeline_user_prompt(
     if normal_only:
         count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条正常正向数据"
         scope_rule = "只生成正向真实数据。禁止边界值、异常值、空值、超长/超短、SQL注入等测试用例。"
+        boundary_section = f"""## 正向数据多样性规则
+用户只需要正常正向数据，不需要边界/异常测试。将 {test_cases_per_step} 条用例全部分配为正向数据：
+- 每条用例的所有字段值都在合法范围内（不测边界、不测异常）
+- 可变字段（数值/文本/枚举）每条用不同的合法值，模拟真实业务场景多样性
+- 数值字段：在合理范围内取不同值（如 1、10、50、100、500）
+- 文本字段：每条用不同的真实场景描述（如 "定期维护"、"零件更换"、"故障修复"）
+- 禁止生成空值、超长、特殊字符、SQL注入等测试数据"""
     elif test_cases_per_step <= 1:
         count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条正向核心用例"
         scope_rule = ""
+        boundary_section = ""
     elif test_cases_per_step <= 5:
         count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条用例，按「边界值覆盖分配规则」严格分配：1条正向 + 剩余覆盖各字段边界（必填/上限/格式）。每条的可变字段值必须不同！"
         scope_rule = ""
+        boundary_section = f"""## 边界值覆盖分配规则（关键）
+用户描述的每个字段约束（必填/上限/下限等）都必须有对应的边界测试用例。
+将 {test_cases_per_step} 条用例按以下优先级分配，确保每个有约束的字段都被覆盖：
+1. **1 条正向全字段正常值**：所有字段使用合法范围内的典型值
+2. **必填字段边界**：必填字段测缺失/空值/非法类型；数值字段测 0、负数、极大值
+3. **字符串上限字段边界**：每个有字符上限的字段各占 1 条 → 测等于上限（max）、超过上限（max+1）
+   - 例：repairReason 上限100字 → 1条测 100 字、下一条测 101 字
+   - 例：repairContent 上限200字 → 1条测 200 字
+   - 字段多的，合并到同一条用例中（一条用例可同时测多个字段边界）
+4. **异常/非法值**：非法枚举、特殊字符、SQL注入等
+5. **剩余配额**：补充其他等价类或组合边界场景
+
+**注意**：如果 {test_cases_per_step} 条不够覆盖所有字段边界，优先覆盖强约束字段（必填 > 上限 > 格式），并在 case_name 中注明「组合边界」。
+"""
     else:
         count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条用例，按「边界值覆盖分配规则」分配：正向 + 各字段边界 + 异常 + 等价类。全面覆盖！"
         scope_rule = ""
+        boundary_section = f"""## 边界值覆盖分配规则（关键）
+用户描述的每个字段约束（必填/上限/下限等）都必须有对应的边界测试用例。
+将 {test_cases_per_step} 条用例按以下优先级分配，确保每个有约束的字段都被覆盖：
+1. **正向全字段正常值**：所有字段使用合法范围内的典型值（占 1-2 条）
+2. **必填字段边界**：必填字段测缺失/空值/非法类型；数值字段测 0、负数、极大值
+3. **字符串上限字段边界**：每个有字符上限的字段各占至少 1 条 → 测等于上限、超过上限
+4. **异常/非法值**：非法枚举、特殊字符、SQL注入等
+5. **等价类组合**：剩余配额覆盖其他等价类或组合边界场景
+"""
 
     return f"""请根据用户的 Pipeline 描述生成多步骤测试用例。
 
@@ -204,9 +241,15 @@ def build_pipeline_user_prompt(
     → 若 data 为数组：[...] → data_dependencies.body 中用 {{{{step1.response.data[0].id}}}}
     → 若 data 为对象：{{records:[...]}} → data_dependencies.body 中用 {{{{step1.response.data.records[0].id}}}}
   「取 Step2 返回的 data.id」→ {{{{step2.response.data.id}}}}
+- **数组索引支持**：
+  * 指定位置：{{{{step1.response.data[2].id}}}} → 获取第 3 个元素的 id（索引从 0 开始）
+  * 随机选取：{{{{step1.response.data.random.id}}}} → 每次随机选取一个元素的 id
+  * 获取长度：{{{{step1.response.data._count}}}} → 获取数组元素个数
+  * 用户说「随机获取」时请使用 random；说「第N个」时请使用 [N-1]
 
 ## 动态数据规则
 - 仅 POST/PUT 步骤需要追加 {{{{timestamp}}}} 保证唯一性（如 "刀具名称_{{{{timestamp}}}}"）
+- **重要**：只有名称/编码类需要唯一性的字段才追加 {{{{timestamp}}}}，静态描述字段（如 description）不要追加
 - GET/查询步骤不需要时间戳
 - 纯数字、布尔值、空字符串不需要追加
 - **数据多样性（关键）**：每个步骤生成的 {test_cases_per_step} 条用例，其中可变字段必须每条都不同！
@@ -214,20 +257,7 @@ def build_pipeline_user_prompt(
   * 文本字段每条用不同内容（如 repairReason: "正常磨损"、"定期维护"、"突发故障"...）
   * 不使用 data_dependencies 引用的静态传参也要适当变化（模拟真实业务场景）
 
-## 边界值覆盖分配规则（关键）
-用户描述的每个字段约束（必填/上限/下限等）都必须有对应的边界测试用例。
-将 {test_cases_per_step} 条用例按以下优先级分配，确保每个有约束的字段都被覆盖：
-1. **1 条正向全字段正常值**：所有字段使用合法范围内的典型值
-2. **必填字段边界**：必填字段测缺失/空值/非法类型；数值字段测 0、负数、极大值
-3. **字符串上限字段边界**：每个有字符上限的字段各占 1 条 → 测等于上限（max）、超过上限（max+1）
-   - 例：repairReason 上限100字 → 1条测 100 字、下一条测 101 字
-   - 例：repairContent 上限200字 → 1条测 200 字
-   - 字段多的，合并到同一条用例中（一条用例可同时测多个字段边界）
-4. **异常/非法值**：非法枚举、特殊字符、SQL注入等
-5. **剩余配额**：补充其他等价类或组合边界场景
-
-**注意**：如果 {test_cases_per_step} 条不够覆盖所有字段边界，优先覆盖强约束字段（必填 > 上限 > 格式），并在 case_name 中注明「组合边界」。
-
+{boundary_section}
 ## 其他要求
 - {count_hint}
 - **重要：每个步骤都要生成恰好 {test_cases_per_step} 条不同的用例！后续步骤也是 {test_cases_per_step} 条！不要只给 Step2+ 生成 1 条！**

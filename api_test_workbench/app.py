@@ -292,6 +292,8 @@ def _init_session_state():
         "env_variables": {},  # 当前激活环境的变量映射
         "show_env_editor": False,  # 是否打开环境编辑器
         "_default_auth_url": "http://bird.ob.shuyilink.com/auth/auth-login",
+        "_default_auth_username": "",
+        "_default_auth_password": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -472,7 +474,7 @@ with st.sidebar:
     st.divider()
 
     # 环境编辑器
-    if st.button("管理环境" if not st.session_state.show_env_editor else "收起编辑器", use_container_width=True):
+    if st.button("管理环境" if not st.session_state.show_env_editor else "收起编辑器", width="stretch"):
         st.session_state.show_env_editor = not st.session_state.show_env_editor
 
     if st.session_state.show_env_editor:
@@ -500,7 +502,7 @@ with st.sidebar:
 
             col_save, _ = st.columns([1, 2])
             with col_save:
-                if st.button("💾 保存环境", use_container_width=True, type="primary"):
+                if st.button("💾 保存环境", width="stretch", type="primary"):
                     if not env_name_input.strip():
                         st.error("请输入环境名称")
                     else:
@@ -533,7 +535,7 @@ with st.sidebar:
 
                 col_save, col_delete = st.columns(2)
                 with col_save:
-                    if st.button("💾 更新环境", use_container_width=True, type="primary"):
+                    if st.button("💾 更新环境", width="stretch", type="primary"):
                         variables = {}
                         for line in edited_vars.strip().split("\n"):
                             line = line.strip()
@@ -554,7 +556,7 @@ with st.sidebar:
                         st.success("已更新")
                         st.rerun()
                 with col_delete:
-                    if st.button("🗑 删除", use_container_width=True):
+                    if st.button("🗑 删除", width="stretch"):
                         delete_environment(edit_target)
                         if st.session_state.active_env == edit_target:
                             st.session_state.active_env = ""
@@ -626,7 +628,7 @@ with tab1:
             with curl_col2:
                 st.write("")
                 st.write("")
-                parse_clicked = st.button("解析", key=f"curl_parse_btn_{i}", use_container_width=True)
+                parse_clicked = st.button("解析", key=f"curl_parse_btn_{i}", width="stretch")
 
             if parse_clicked:
                 raw = curl_input.strip()
@@ -732,7 +734,7 @@ with tab1:
         st.rerun()
 
     # 添加步骤按钮
-    if st.button("+ 添加步骤", use_container_width=True, type="secondary"):
+    if st.button("+ 添加步骤", width="stretch", type="secondary"):
         st.session_state.pipeline.steps.append(ApiStep(
             name="",
             config=ApiConfig(method="GET", headers={"Content-Type": "application/json"}, body_template={}),
@@ -754,7 +756,7 @@ with tab1:
                 "注入步骤": f"Step {b.target_step_index + 1}",
                 "注入位置": b.target_location,
             })
-        st.dataframe(binding_rows, use_container_width=True, hide_index=True)
+        st.dataframe(binding_rows, width="stretch", hide_index=True)
     elif len(steps) > 1:
         st.info("尚未定义步骤间的数据依赖。在下方「字段定义」中用自然语言描述后点击「生成测试数据」，AI 会自动建立数据链路。")
 
@@ -796,7 +798,7 @@ with tab1:
         )
     with gen_col2:
         st.write("")
-        generate_clicked = st.button("生成测试数据", type="primary", use_container_width=True)
+        generate_clicked = st.button("生成测试数据", type="primary", width="stretch")
 
     if generate_clicked:
         if not st.session_state.field_requirements.strip():
@@ -859,7 +861,7 @@ with tab1:
                         "assertion_logic": st.column_config.TextColumn("断言逻辑", width="medium"),
                     },
                     num_rows="dynamic",
-                    use_container_width=True,
+                    width="stretch",
                     height=min(len(tc_data) * 38 + 40, 400),
                     key=f"tc_editor_step_{step_idx}",
                 )
@@ -907,7 +909,7 @@ with tab1:
         with c3:
             st.write("")
             st.write("")
-            if st.button("获取 Session", use_container_width=True):
+            if st.button("获取 Session", width="stretch"):
                 try:
                     username = st.session_state.get("auth_username", "").strip()
                     password = st.session_state.get("auth_password", "").strip()
@@ -936,12 +938,12 @@ with tab1:
 
     exec_col1, exec_col2, _ = st.columns([1, 1, 3])
     with exec_col1:
-        run_clicked = st.button("执行 Pipeline", type="primary", use_container_width=True, disabled=exec_disabled)
+        run_clicked = st.button("执行 Pipeline", type="primary", width="stretch", disabled=exec_disabled)
     with exec_col2:
         # 导出 pytest 按钮
         if has_cases:
             # 使用 expander 避免每次生成 ZIP
-            if st.button("📦 导出 pytest", key="export_test_tab", use_container_width=True, disabled=exec_disabled):
+            if st.button("📦 导出 pytest", key="export_test_tab", width="stretch", disabled=exec_disabled):
                 try:
                     exporter = PytestExporter(
                         pipeline=st.session_state.pipeline,
@@ -963,10 +965,10 @@ with tab1:
                     data=st.session_state["_export_zip"],
                     file_name=st.session_state.get("_export_name", "pytest_export.zip"),
                     mime="application/zip",
-                    use_container_width=True,
+                    width="stretch",
                 )
         else:
-            st.button("📦 导出 pytest", key="export_test_tab_noop", use_container_width=True, disabled=True, help="请先生成测试用例")
+            st.button("📦 导出 pytest", key="export_test_tab_noop", width="stretch", disabled=True, help="请先生成测试用例")
 
     if run_clicked:
         if not st.session_state.auth_ok:
@@ -1121,7 +1123,7 @@ with tab1:
                 data=html_report,
                 file_name=f"api_test_report_{pipeline_results.pipeline_name}.html",
                 mime="text/html",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
             )
         with col_json:
@@ -1134,7 +1136,7 @@ with tab1:
                 data=json_report,
                 file_name=f"api_test_report_{pipeline_results.pipeline_name}.json",
                 mime="application/json",
-                use_container_width=True,
+                width="stretch",
             )
 
 
@@ -1179,7 +1181,7 @@ with tab2:
             data_count = st.number_input("每步生成数量", min_value=1, max_value=500, value=50, step=10, key="data_gen_count")
         with col2:
             st.write("")
-            gen_data_clicked = st.button("🤖 生成数据", type="primary", use_container_width=True, disabled=not write_idx)
+            gen_data_clicked = st.button("🤖 生成数据", type="primary", width="stretch", disabled=not write_idx)
 
         if gen_data_clicked:
             if not data_desc.strip():
@@ -1219,7 +1221,7 @@ Body 模板（已有默认值，只需随机化用户指定的字段）：{json.
 - 名称/编码字段使用 {{{{index}}}} 占位符（运行时替换为递增序号）
 - expected_status_code 一律 200，assertion_logic: str(resp_json['code']) == '0'
 - 只输出 JSON"""
-                            raw = _call_ai(api_key, DATA_GEN_SYSTEM_PROMPT, step_prompt, model)
+                            raw, _ = _call_ai(api_key, DATA_GEN_SYSTEM_PROMPT, step_prompt, model)
                             parsed = _parse_json_with_retry(api_key, raw, model)
                             raw_cases = [_make_test_case(tc) for tc in parsed.get("test_cases", [])]
                             # 替换 {{index}} 为实际序号（001, 002, ...）
@@ -1248,10 +1250,10 @@ Body 模板（已有默认值，只需随机化用户指定的字段）：{json.
 
         exec_col1, exec_col2, _ = st.columns([1, 1, 3])
         with exec_col1:
-            run_data_clicked = st.button("▶ 执行造数据", type="primary", use_container_width=True, disabled=not has_data)
+            run_data_clicked = st.button("▶ 执行造数据", type="primary", width="stretch", disabled=not has_data)
         with exec_col2:
             if has_data:
-                if st.button("📦 导出 pytest", key="export_data_tab", use_container_width=True):
+                if st.button("📦 导出 pytest", key="export_data_tab", width="stretch"):
                     try:
                         exporter = PytestExporter(
                             pipeline=st.session_state.pipeline,
@@ -1273,7 +1275,7 @@ Body 模板（已有默认值，只需随机化用户指定的字段）：{json.
                         data=st.session_state._export_data_zip,
                         file_name=st.session_state.get("_export_data_name", "data_gen.zip"),
                         mime="application/zip",
-                        use_container_width=True,
+                        width="stretch",
                     )
 
         if run_data_clicked:

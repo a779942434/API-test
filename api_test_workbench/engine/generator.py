@@ -146,6 +146,9 @@ def _retry_api_call(fn, max_retries: int = 3, backoff: float = 1.5):
                 time.sleep(wait)
         except RuntimeError as e:
             msg = str(e)
+            # 截断错误不可重试（相同 prompt 必然再次截断），直接向上抛给调用方处理
+            if "finish_reason=length" in msg or "截断" in msg:
+                raise
             if "429" in msg or "503" in msg or "502" in msg:
                 last_exc = e
                 if attempt < max_retries - 1:
@@ -192,7 +195,10 @@ def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, model: st
     finish_reason = choice.get("finish_reason", "")
     content = choice["message"]["content"]
     if finish_reason == "length":
-        log.warning("DeepSeek 输出被截断 (finish_reason=length)，返回内容可能不完整")
+        # 截断但仍有部分可用内容 → 标记截断供调用方决定续写
+        log.warning("DeepSeek 输出被截断 (finish_reason=length, %d 字符)，将尝试续写", len(content))
+        # 在返回值前追加特殊标记，供 _call_ai 检测
+        return content + "\n\n__TRUNCATED__"
     return content
 
 
@@ -205,7 +211,12 @@ def _call_anthropic(api_key: str, system_prompt: str, user_prompt: str, model: s
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        return response.content[0].text
+        # 安全提取 text：遍历 content 找到第一个 text 块（兼容 tool_use 等非文本块）
+        for block in response.content:
+            if hasattr(block, 'text') and block.text:
+                return block.text
+        # 兜底：如果所有块都没有 text，尝试字符串化
+        return str(response.content[0]) if response.content else ""
     except ImportError:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -223,15 +234,29 @@ def _call_anthropic(api_key: str, system_prompt: str, user_prompt: str, model: s
         )
         if resp.status_code != 200:
             raise RuntimeError(f"Anthropic API 返回 {resp.status_code}: {resp.text}")
-        return resp.json()["content"][0]["text"]
+        # 安全提取 text 块
+        for block in resp.json().get("content", []):
+            if block.get("type") == "text" and block.get("text"):
+                return block["text"]
+        return resp.json()["content"][0].get("text", "")
 
 
-def _call_ai(api_key: str, system_prompt: str, user_prompt: str, model: str) -> str:
-    """统一的 AI 调用入口，自动选择 provider 并带重试"""
+def _call_ai(api_key: str, system_prompt: str, user_prompt: str, model: str) -> tuple[str, bool]:
+    """统一的 AI 调用入口，自动选择 provider 并带重试。
+
+    Returns:
+        (content, was_truncated) — was_truncated 表示输出是否因 token 限制被截断
+    """
     provider = _detect_provider(api_key)
     if provider == "deepseek":
-        return _retry_api_call(lambda: _call_deepseek(api_key, system_prompt, user_prompt, model))
-    return _retry_api_call(lambda: _call_anthropic(api_key, system_prompt, user_prompt, model))
+        raw = _retry_api_call(lambda: _call_deepseek(api_key, system_prompt, user_prompt, model))
+    else:
+        raw = _retry_api_call(lambda: _call_anthropic(api_key, system_prompt, user_prompt, model))
+    # 检测截断标记（DeepSeek 在截断时追加）
+    was_truncated = "__TRUNCATED__" in raw
+    if was_truncated:
+        raw = raw.replace("\n\n__TRUNCATED__", "").replace("__TRUNCATED__", "")
+    return raw, was_truncated
 
 
 def _parse_json_with_retry(api_key: str, raw_text: str, model: str) -> dict:
@@ -261,15 +286,20 @@ def _parse_json_with_retry(api_key: str, raw_text: str, model: str) -> dict:
         pass
 
     # ── 策略 3: AI 修复 ──
-    # 只发送最后 8000 字符（JSON 错误通常在尾部，前面的内容没必要全发）
-    snippet = cleaned[-8000:] if len(cleaned) > 8000 else cleaned
+    # 保留开头和结尾各一半（语法错误可能在开头如缺少 {，也可能在结尾）
+    max_len = 8000
+    if len(cleaned) > max_len:
+        half = max_len // 2
+        snippet = cleaned[:half] + "\n... (省略中间部分) ...\n" + cleaned[-half:]
+    else:
+        snippet = cleaned
     retry_prompt = (
         f"以下 JSON 无法解析，错误信息：{first_error}\n\n"
         f"请修复 JSON 语法错误（补全缺失的 }}、] 或逗号），只输出合法 JSON，不要任何解释：\n\n"
         f"{snippet}"
     )
     try:
-        raw = _call_ai(api_key, "你是一个 JSON 修复器。只输出 JSON，不要任何解释。", retry_prompt, model)
+        raw, _ = _call_ai(api_key, "你是一个 JSON 修复器。只输出 JSON，不要任何解释。", retry_prompt, model)
         fixed = _clean_json_response(raw)
         try:
             return json.loads(fixed)
@@ -321,7 +351,7 @@ def generate_test_cases(
 
     log.info("生成单接口测试用例: %s %s", method, api_url)
     user_prompt = build_user_prompt(field_requirements, api_url, method)
-    raw = _call_ai(api_key, SYSTEM_PROMPT, user_prompt, model)
+    raw, _ = _call_ai(api_key, SYSTEM_PROMPT, user_prompt, model)
     data = _parse_json_with_retry(api_key, raw, model)
     test_cases = [_make_test_case(tc) for tc in data.get("test_cases", [])]
     log.info("生成完成: %d 条用例", len(test_cases))
@@ -338,6 +368,8 @@ def generate_pipeline_test_cases(
 
     data_dependencies 存入 TestCase 对象，不再修改 pipeline 原始配置，
     由 runner 在执行时动态应用。
+
+    当 DeepSeek 输出超过 8192 token 上限被截断时，自动发起续写请求补齐缺失用例。
     """
     api_key = _get_api_key()
     provider = _detect_provider(api_key)
@@ -354,16 +386,74 @@ def generate_pipeline_test_cases(
         test_cases_per_step=test_cases_per_step,
     )
 
-    log.info("生成 Pipeline 测试用例: %d 步, 每步 %d 条", len(pipeline.steps), test_cases_per_step)
-    raw = _call_ai(api_key, PIPELINE_SYSTEM_PROMPT, user_prompt, model)
+    num_steps = len(pipeline.steps)
+    expected_total = num_steps * test_cases_per_step
+    log.info("生成 Pipeline 测试用例: %d 步, 每步 %d 条 (期望 %d 条)",
+             num_steps, test_cases_per_step, expected_total)
+
+    raw, was_truncated = _call_ai(api_key, PIPELINE_SYSTEM_PROMPT, user_prompt, model)
     data = _parse_json_with_retry(api_key, raw, model)
 
+    test_cases_by_step = _extract_cases_from_response(data, num_steps)
+    actual_total = sum(len(v) for v in test_cases_by_step.values())
+
+    # 检查是否需要续写（仅在确认截断且用例数不足时）
+    if was_truncated and actual_total < expected_total:
+        missing = expected_total - actual_total
+        log.warning("用例数不足: 期望 %d 条, 实际 %d 条, 缺失 %d 条。尝试续写...",
+                     expected_total, actual_total, missing)
+
+        # 续写请求：让 AI 从截断处继续生成
+        continuation_prompt = (
+            f"你的上一次 JSON 输出被 token 上限截断了，只生成了 {actual_total} 条用例"
+            f"（{len(test_cases_by_step)} 个步骤），"
+            f"但需要恰好 {expected_total} 条（{num_steps} 步 × 每步 {test_cases_per_step} 条）。\n\n"
+            f"请**只输出**剩余缺失步骤的 test_cases（不要重复已生成的），"
+            f"格式同上：{{\"steps\": [{{\"test_cases\": [...]}}]}}\n\n"
+            f"当前各步骤已有用例数: { {i: len(v) for i, v in test_cases_by_step.items()} }\n"
+            f"各步骤还需: { {i: test_cases_per_step - len(v) for i, v in test_cases_by_step.items() if len(v) < test_cases_per_step} }\n\n"
+            f"只输出合法 JSON，不要解释。"
+        )
+        try:
+            cont_raw, _ = _call_ai(api_key, PIPELINE_SYSTEM_PROMPT, continuation_prompt, model)
+            cont_data = _parse_json_with_retry(api_key, cont_raw, model)
+            cont_cases = _extract_cases_from_response(cont_data, num_steps)
+
+            # 合并：将续写的用例追加到已有步骤
+            for step_idx, tcs in cont_cases.items():
+                if step_idx in test_cases_by_step:
+                    existing = test_cases_by_step[step_idx]
+                    needed = test_cases_per_step - len(existing)
+                    if needed > 0:
+                        existing.extend(tcs[:needed])
+                else:
+                    test_cases_by_step[step_idx] = tcs[:test_cases_per_step]
+
+            actual_total = sum(len(v) for v in test_cases_by_step.values())
+            log.info("续写完成: 总计 %d 条用例", actual_total)
+        except Exception as e:
+            log.warning("续写失败: %s，使用截断结果 (%d 条)", str(e), actual_total)
+
+    if actual_total < expected_total:
+        if was_truncated:
+            log.warning("（已尝试续写）最终用例数 %d < 期望 %d，建议减少每步用例数或切换到 Anthropic",
+                         actual_total, expected_total)
+        else:
+            log.warning("AI 未生成足够用例: 期望 %d 条, 实际 %d 条（非截断原因，可能是 prompt 理解偏差）",
+                         expected_total, actual_total)
+
+    log.info("Pipeline 生成完成: %d 步, %d 条用例", len(test_cases_by_step), actual_total)
+    return test_cases_by_step
+
+
+def _extract_cases_from_response(data: dict, num_steps: int) -> dict[int, list]:
+    """从 AI 返回的 JSON 中提取用例，按步骤索引分组"""
     test_cases_by_step = {}
     for idx, step_data in enumerate(data.get("steps", [])):
-        # 用 AI 返回数组的位置作为步骤索引（0,1,2...），不依赖 AI 的 step_index 字段
+        if idx >= num_steps:
+            log.warning("AI 返回了 %d 个步骤，期望 %d 个，忽略多余步骤", len(data["steps"]), num_steps)
+            break
         test_cases_by_step[idx] = [
             _make_test_case(tc) for tc in step_data.get("test_cases", [])
         ]
-    total = sum(len(v) for v in test_cases_by_step.values())
-    log.info("Pipeline 生成完成: %d 步, %d 条用例", len(test_cases_by_step), total)
     return test_cases_by_step

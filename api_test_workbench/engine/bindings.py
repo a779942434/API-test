@@ -18,8 +18,12 @@ def extract_value(data: dict, path: str) -> Any:
     示例：
         "data.id"           → data["data"]["id"]
         "data.items[0].id"  → data["data"]["items"][0]["id"]
+        "data.items[2].id"  → data["data"]["items"][2]["id"]（指定位置）
+        "data.items.random.id" → 随机选取一个元素的 id
         "code"              → data["code"]
     """
+    import random as _random
+
     if not path:
         raise KeyError("empty path")
 
@@ -31,6 +35,8 @@ def extract_value(data: dict, path: str) -> Any:
             current = current[part]
         elif isinstance(current, (list, tuple)) and part.lstrip('-').isdigit():
             current = current[int(part)]
+        elif isinstance(current, (list, tuple)) and part == 'random' and len(current) > 0:
+            current = _random.choice(current)
         else:
             raise KeyError(f"Cannot resolve path '{path}': key '{part}' not found")
     return current
@@ -42,16 +48,22 @@ def _flatten_response(data, prefix: str = "response") -> dict[str, Any]:
     支持 dict 和 list 类型的顶层数据。
 
     返回示例：
-        {"response.code": "0", "response.data[0].id": 123, "response.data.id": 123}
-        （data 是数组时，data.id 自动别名到 data[0].id）
+        {"response.code": "0", "response.data[0].id": 123, "response.data.id": 123,
+         "response.data._count": 3}
+        （data 是数组时，data.id 自动别名到 data[0].id，支持 data.random.id 随机选取）
     """
+    import random as _random
+
     result = {}
+    # 记录数组路径 → 长度，供 random 解析和 _count 别名使用
+    _array_lengths: dict[str, int] = {}
 
     def _flatten(obj, current_prefix):
         if isinstance(obj, dict):
             for k, v in obj.items():
                 _flatten(v, f"{current_prefix}.{k}")
         elif isinstance(obj, list):
+            _array_lengths[current_prefix] = len(obj)
             for i, item in enumerate(obj):
                 _flatten(item, f"{current_prefix}[{i}]")
         else:
@@ -59,7 +71,7 @@ def _flatten_response(data, prefix: str = "response") -> dict[str, Any]:
 
     _flatten(data, prefix)
 
-    # 生成数组别名：response.data[0].id → response.data.id
+    # 生成数组别名：response.data[0].id → response.data.id（固定映射到 [0]）
     aliases = {}
     for key in list(result.keys()):
         m = re.match(r'^(.+)\[0\](.*)$', key)
@@ -69,16 +81,42 @@ def _flatten_response(data, prefix: str = "response") -> dict[str, Any]:
                 aliases[alias] = result[key]
     result.update(aliases)
 
+    # 生成数组 _count 别名：response.data._count = 数组长度
+    for arr_path, length in _array_lengths.items():
+        count_key = f"{arr_path}._count"
+        if count_key not in result:
+            result[count_key] = length
+
+    # 生成 random 别名：对每个数组的第一个元素属性，同时生成 random 版本
+    # response.data[0].id → response.data.random.id（随机选取，每次解析时动态求值）
+    random_aliases = {}
+    for key in list(result.keys()):
+        m = re.match(r'^(.+)\[0\](.+)$', key)
+        if m:
+            arr_path = m.group(1)
+            suffix = m.group(2)
+            # 检查该数组是否有多个元素
+            if _array_lengths.get(arr_path, 0) > 1:
+                random_key = f"{arr_path}.random{suffix}"
+                if random_key not in result and random_key not in random_aliases:
+                    # 存储一个特殊标记，在 resolve_placeholders 中动态解析
+                    random_aliases[random_key] = {
+                        "_is_random": True,
+                        "array_path": arr_path,
+                        "suffix": suffix,
+                    }
+    result.update(random_aliases)
+
     # 生成常见包装名别名：response.data[0].id → response.data.records[0].id
     # 当 API 返回 data 为数组但 AI 误加 records/list/items 包装段时，仍能精确匹配
     wrapper_aliases = {}
     for key in list(result.keys()):
         m = re.match(r'^(.+)\[0\](.*)$', key)
         if m:
-            prefix = m.group(1)
-            suffix = m.group(2)
+            pfx = m.group(1)
+            sfx = m.group(2)
             for wrapper in ('records', 'list', 'items'):
-                alias = f"{prefix}.{wrapper}[0]{suffix}"
+                alias = f"{pfx}.{wrapper}[0]{sfx}"
                 if alias not in result and alias not in wrapper_aliases:
                     wrapper_aliases[alias] = result[key]
     result.update(wrapper_aliases)
@@ -146,7 +184,14 @@ def resolve_placeholders(template: Any, context: PipelineContext) -> Any:
     template 可以是 str / dict / list — 会递归处理。
     context.extracted_values[step_index] = {"response.data.id": 123, ...}
     占位符格式：{{step1.response.data.id}}（1-based 用户索引）
+
+    支持特殊路径：
+    - response.data[2].id → 精确获取第 2 个元素的 id
+    - response.data.random.id → 随机获取某个元素的 id
+    - response.data._count → 获取数组长度
     """
+    import random as _random
+
     if isinstance(template, str):
         def _replacer(m):
             step_1based = int(m.group(1))      # 用户输入的是 1-based
@@ -161,13 +206,41 @@ def resolve_placeholders(template: Any, context: PipelineContext) -> Any:
 
             step_data = context.extracted_values[step_index]
 
+            # 被忽略的步骤引用 → 友好错误
+            if step_data.get("_ignored"):
+                raise ValueError(
+                    f"Cannot resolve '{m.group(0)}': "
+                    f"step {step_1based} 已被忽略，无可用数据"
+                )
+
             if path in step_data:
-                return str(step_data[path])
+                val = step_data[path]
+                # 处理 random 别名：值是 {_is_random: True, array_path, suffix} 时动态解析
+                if isinstance(val, dict) and val.get("_is_random"):
+                    arr_path = val["array_path"]
+                    suffix = val["suffix"]
+                    count = step_data.get(f"{arr_path}._count", 1)
+                    idx = _random.randint(0, count - 1)
+                    random_key = f"{arr_path}[{idx}]{suffix}"
+                    log.debug("random 路径 '%s' 解析为 '%s' (0-%d)", path, random_key, count - 1)
+                    if random_key in step_data:
+                        return str(step_data[random_key])
+                return str(val)
 
             # 尝试回退路径（处理 AI 生成路径与实际响应结构不匹配的情况）
             fallback = _try_fallback_path(path, step_data)
             if fallback is not None:
-                return str(step_data[fallback])
+                val = step_data[fallback]
+                if isinstance(val, dict) and val.get("_is_random"):
+                    arr_path = val["array_path"]
+                    suffix = val["suffix"]
+                    count = step_data.get(f"{arr_path}._count", 1)
+                    idx = _random.randint(0, count - 1)
+                    random_key = f"{arr_path}[{idx}]{suffix}"
+                    log.debug("random 回退路径 '%s' → '%s' 解析为 '%s'", path, fallback, random_key)
+                    if random_key in step_data:
+                        return str(step_data[random_key])
+                return str(val)
 
             raise KeyError(
                 f"Cannot resolve '{m.group(0)}': path '{path}' "

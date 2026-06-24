@@ -588,8 +588,18 @@ def api_headers(env_config):
                 f"[{{case_id}}] HTTP状态码异常: {{resp.status_code}} (期望 {{expected_status}})"
             )
         if assertion and assertion != "pass  # 无断言":
-            # 注意：参数化的断言逻辑需手动转换为类型安全的 assert 语句
-            pass
+            # 生成类型安全的基础断言（参数化用例至少校验业务 code）
+            try:
+                converted = _convert_assertion(assertion)
+                # _convert_assertion 返回的已经是完整 assert 语句
+                lines.append(f'        {converted}')
+            except Exception:
+                # 转换失败时至少校验 code != '0'（异常/边界用例）
+                if expected_status and expected_status >= 400:
+                    lines.append(
+                        f'        assert str(result.get("code", "")) != "0", '
+                        f'f"[{{case_id}}] 期望业务失败但 code=0"'
+                    )
         print(f"[{{case_id}}] {{case_name}}: HTTP={{resp.status_code}}, body={{str(result)[:200]}}")
 ''')
         return methods
@@ -659,18 +669,22 @@ def api_headers(env_config):
         return '\n'.join(lines)
 
     def _dynamize_body(self, body: dict) -> dict:
-        """递归处理 body，对需要唯一性的字段值做动态化标记
+        """递归处理 body，仅对 AI 标记了 {{timestamp}} 的字段做动态化。
 
-        静态值 "测试刀具A001" → 动态标记 _DYNAMIZE_<原始值>
-        渲染时再替换为 f"测试刀具A001_{self.TS}"
+        AI 在 input_data 中为需要唯一性的字段设置 "{{timestamp}}"，
+        合并到 body_template 后由此函数转换为运行时 self.TS 拼接。
+
+        静态值（如 "正常报修"）不会被无差别动态化，保持原样。
         """
         if isinstance(body, dict):
             return {k: self._dynamize_body(v) for k, v in body.items()}
         elif isinstance(body, list):
             return [self._dynamize_body(v) for v in body]
         elif isinstance(body, str) and body:
-            # 使用特殊标记，后续 _render_body_code 中替换为 f-string
-            return f"_DYNAMIZE_{body}"
+            if '{{timestamp}}' in body:
+                # AI 标记的字段 → 使用 _DYNAMIZE_ 内部标记，_render_body_code 中展开为 f-string
+                return f"_DYNAMIZE_{body.replace('{{timestamp}}', '')}"
+            return body
         return body
 
     def _render_body_code(self, body, indent: int = 8) -> str:
@@ -797,9 +811,17 @@ def api_headers(env_config):
         return '\n'.join(lines) if lines else ""
 
     @staticmethod
-    def _merge_body(template, input_data: dict) -> dict:
-        """合并 body_template + input_data"""
+    def _merge_body(template, input_data: dict):
+        """合并 body_template + input_data，支持 dict 和 list 类型。
+
+        返回类型与 template 一致，input_data 中的变化字段会被合并/覆盖。
+        """
         if isinstance(template, list):
+            # 数组类型：input_data 如果是 list 则替换，dict 则包裹为单元素数组
+            if isinstance(input_data, list):
+                return input_data
+            if isinstance(input_data, dict) and input_data:
+                return [input_data]
             return template
         result = {}
         if isinstance(template, dict):

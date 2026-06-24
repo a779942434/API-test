@@ -159,11 +159,14 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_con
         assertion_logic,
     )
 
-    # 安全检查：拒绝包含潜在沙箱逃逸特征的断言
-    dangerous = ("__", "import", "exec", "compile", "open", "getattr", "setattr", "delattr")
-    lower = assertion_logic.lower()
+    # 安全检查：拒绝包含潜在沙箱逃逸特征的断言（使用 \b 词边界避免误报，
+    # 如 "important" 不再因包含 "import" 而被拒绝）
+    dangerous = (r"\b__\w*__\b", r"\bimport\b", r"\bexec\b", r"\bcompile\b",
+                 r"\bopen\b", r"\bgetattr\b", r"\bsetattr\b", r"\bdelattr\b",
+                 r"\beval\b", r"\bglobals\b", r"\blocals\b")
+    lowered = assertion_logic.lower()
     for pat in dangerous:
-        if pat in lower:
+        if re.search(pat, lowered):
             return False, f"断言包含不安全字符: {pat}"
 
     try:
@@ -178,11 +181,20 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_con
         "json": resp_json,
         "str": str,
         "int": int,
+        "float": float,
         "bool": bool,
         "len": len,
         "isinstance": isinstance,
         "list": list,
         "dict": dict,
+        "tuple": tuple,
+        "min": min,
+        "max": max,
+        "abs": abs,
+        "round": round,
+        "sum": sum,
+        "any": any,
+        "all": all,
         "in": lambda a, b: a in b,
         "True": True,
         "False": False,
@@ -274,9 +286,9 @@ def run_single_test(
         log.debug("请求体: %s", str(request_body)[:500])
         start = time.perf_counter()
         if method == "GET":
-            resp = session.get(url, headers=api_config.headers, params=request_body)
+            resp = session.get(url, headers=api_config.headers, params=request_body, timeout=30)
         elif method in ("POST", "PUT", "DELETE", "PATCH"):
-            resp = session.request(method, url, headers=api_config.headers, json=request_body)
+            resp = session.request(method, url, headers=api_config.headers, json=request_body, timeout=30)
         else:
             return TestResult(
                 case_id=tc.case_id,
@@ -488,34 +500,47 @@ def execute_pipeline(
                     actual_status_code=0, expected_status_code=0, response_body=None,
                     response_time_ms=0.0,
                 ))
-                # P1#10: 填充空上下文，避免下游步骤的占位符引用时报 ValueError
-                context.extracted_values[step_idx] = {}
+                # 填充空上下文，标记为已忽略（下游引用时给出明确提示）
+                context.extracted_values[step_idx] = {"_ignored": True}
                 log.debug("Step %d 已忽略，填充空上下文", step_idx + 1)
                 continue
 
             step_tcs = test_cases_by_step.get(step_idx, [])
             if not step_tcs:
                 continue
-            # 该步骤用例数不足时复用最后一条（后续步骤通常只有1条，data_dependencies 自动引用当前链路数据）
-            tc = step_tcs[min(case_idx, len(step_tcs) - 1)]
-            if progress_callback:
-                progress_callback(step_idx, total_steps,
-                    StepResult(step_index=step_idx, step_name=step.name, test_results=[]))
+            # 该步骤用例数不足时复用最后一条
+            tc_idx = min(case_idx, len(step_tcs) - 1)
+            if tc_idx != case_idx:
+                log.info("Step %d 用例数(%d)不足，链路 %d 复用用例 #%d", step_idx + 1, len(step_tcs), case_idx + 1, tc_idx)
+            tc = step_tcs[tc_idx]
 
             try:
+                # progress_callback 移入 try 块内，避免回调异常导致 pipeline 崩溃
+                if progress_callback:
+                    try:
+                        progress_callback(step_idx, total_steps,
+                            StepResult(step_index=step_idx, step_name=step.name, test_results=[]))
+                    except Exception:
+                        pass
+
                 resolved_config = resolve_step_config(step, context, env_variables)
 
                 # 应用 data_dependencies
                 tc_config = resolved_config
                 deps = getattr(tc, 'data_dependencies', {}) or {}
                 if deps:
+                    # 安全解析 headers JSON
+                    dep_headers = {}
+                    if deps.get("headers"):
+                        try:
+                            dep_headers = json.loads(deps["headers"]) if isinstance(deps["headers"], str) else deps["headers"]
+                        except (json.JSONDecodeError, TypeError) as e:
+                            log.warning("data_dependencies.headers 解析失败: %s", e)
                     tc_config = ApiConfig(
                         name=resolved_config.name,
                         url=deps.get("url", resolved_config.url),
                         method=resolved_config.method,
-                        headers=({**resolved_config.headers, **(
-                            json.loads(deps["headers"]) if isinstance(deps.get("headers"), str) else deps["headers"]
-                        )} if deps.get("headers") else resolved_config.headers),
+                        headers=({**resolved_config.headers, **dep_headers} if dep_headers else resolved_config.headers),
                         body_template=_apply_body_deps(resolved_config.body_template, deps.get("body")),
                     )
                     tc_config = resolve_step_config(
@@ -592,6 +617,7 @@ def execute_pipeline(
             for r in results:
                 if r.passed and isinstance(r.response_body, dict):
                     extracted = _flatten_response(r.response_body)
+                    log.debug("Step %d 提取数据来源: [%s] %s", step_idx + 1, r.case_id, r.case_name)
                     break
         else:
             passed = True

@@ -58,7 +58,7 @@ def parse_curl(curl_str: str) -> dict:
             i += 1
             if i >= len(tokens):
                 raise ValueError(f"{t} 缺少 Header 参数")
-            k, _, v = tokens[i].partition(':')
+            k, _, v = tokens[i].partition(':')  # 仅第一个冒号分隔，值中可含冒号（如 Cookie: session=abc:def）
             headers[k.strip()] = v.strip()
 
         elif t in ('-d', '--data', '--data-raw', '--data-binary'):
@@ -66,6 +66,11 @@ def parse_curl(curl_str: str) -> dict:
             if i >= len(tokens):
                 raise ValueError(f"{t} 缺少 Body 参数")
             body = tokens[i]
+            if body.startswith('@'):
+                raise ValueError(
+                    f"不支持从文件读取请求体（{body}）。"
+                    f"请手动将文件内容粘贴到 Body 模板中，或使用 -d '{{...}}' 格式。"
+                )
 
         elif t in ('-b', '--cookie'):
             # Cookie 由底部登录 Session 管理，curl 中附带的旧 Cookie 忽略
