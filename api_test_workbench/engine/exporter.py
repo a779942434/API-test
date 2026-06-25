@@ -247,6 +247,50 @@ def _gen_teardown_comment(step_idx: int, create_url: str) -> str:
         f'        #     assert resp.status_code == 200\n'
     )
 
+
+def _render_hook_code(hook_str: str, indent: str = "        ") -> str:
+    """将钩子 JSON 字符串转换为 pytest 可执行的 Python 代码块。
+
+    Args:
+        hook_str: pre_condition 或 post_condition 字符串
+        indent: 缩进字符串
+
+    Returns:
+        可执行的代码块字符串，或空字符串（钩子为空/纯文本描述时）
+    """
+    if not hook_str or not hook_str.strip():
+        return ""
+    try:
+        action = json.loads(hook_str)
+    except (json.JSONDecodeError, TypeError):
+        return ""  # 纯文本描述，不生成代码
+
+    if not isinstance(action, dict) or "url" not in action:
+        return ""
+
+    method = (action.get("method") or "GET").upper()
+    url = action["url"]
+    body = action.get("body") or action.get("data") or {}
+    headers = action.get("headers", {})
+
+    header_str = json.dumps(headers) if headers else "{}"
+    body_str = json.dumps(body, ensure_ascii=False) if body else "{}"
+    safe_url = repr(url)  # 安全转义，防止引号注入
+
+    if method == "GET":
+        http_call = f'login_session.get({safe_url}, headers={header_str}, params={body_str})'
+    else:
+        http_call = f'login_session.{method.lower()}({safe_url}, json={body_str}, headers={header_str})'
+
+    return (
+        f'{indent}# 钩子: {hook_str[:80]}\n'
+        f'{indent}try:\n'
+        f'{indent}    {http_call}\n'
+        f'{indent}except Exception:\n'
+        f'{indent}    pass  # 钩子失败不影响主测试\n'
+    )
+
+
 class PytestExporter:
     """将 Pipeline + TestCase 导出为标准 pytest 脚本"""
 
@@ -516,6 +560,15 @@ def api_headers(env_config):
                     lines.append(method)
                     lines.append('')
 
+            # 模糊测试用例
+            fuzz_methods = self._gen_fuzz_parametrize()
+            if fuzz_methods:
+                lines.append('    # ========== 模糊测试用例（自动边界探测） ==========')
+                lines.append('')
+                for method in fuzz_methods:
+                    lines.append(method)
+                    lines.append('')
+
         return '\n'.join(lines)
 
     def _gen_positive_chain(self) -> list[str]:
@@ -534,7 +587,7 @@ def api_headers(env_config):
         """按步骤分组，生成参数化的边界/异常测试"""
         methods = []
         for step_idx in sorted(self.test_cases_by_step.keys()):
-            tcs = [t for t in self.test_cases_by_step[step_idx] if t.category != "positive"]
+            tcs = [t for t in self.test_cases_by_step[step_idx] if t.category not in ("positive", "fuzz")]
             if not tcs:
                 continue
             step = self.pipeline.steps[step_idx]
@@ -545,10 +598,13 @@ def api_headers(env_config):
             for tc in tcs:
                 input_json = json.dumps(tc.input_data, ensure_ascii=False)
                 assertion = tc.assertion_logic.replace('"', '\\"').replace('\n', ' ')
+                # 使用 json.dumps 二次序列化确保安全嵌入（处理含引号/特殊字符的值）
+                safe_input = json.dumps(input_json, ensure_ascii=False)
+                safe_assertion = json.dumps(assertion, ensure_ascii=False)
                 param_rows.append(
                     f'        ("{tc.case_id}", "{tc.case_name}", '
-                    f'\'{input_json}\', {tc.expected_status_code}, '
-                    f'"{assertion}"),'
+                    f'{safe_input}, {tc.expected_status_code}, '
+                    f'{safe_assertion}),'
                 )
 
             http_method = step.config.method.lower()
@@ -592,15 +648,78 @@ def api_headers(env_config):
             try:
                 converted = _convert_assertion(assertion)
                 # _convert_assertion 返回的已经是完整 assert 语句
-                lines.append(f'        {converted}')
+                exec(converted)
             except Exception:
                 # 转换失败时至少校验 code != '0'（异常/边界用例）
                 if expected_status and expected_status >= 400:
-                    lines.append(
-                        f'        assert str(result.get("code", "")) != "0", '
-                        f'f"[{{case_id}}] 期望业务失败但 code=0"'
+                    assert str(result.get("code", "")) != "0", (
+                        f"[{{case_id}}] 期望业务失败但 code=0"
                     )
+                else:
+                    raise  # 非 4xx 预期的异常必须传播（如 AssertionError）
         print(f"[{{case_id}}] {{case_name}}: HTTP={{resp.status_code}}, body={{str(result)[:200]}}")
+''')
+        return methods
+
+    def _gen_fuzz_parametrize(self) -> list[str]:
+        """按步骤分组，生成参数化的模糊测试用例（@pytest.mark.fuzz 标记）"""
+        methods = []
+        for step_idx in sorted(self.test_cases_by_step.keys()):
+            tcs = [t for t in self.test_cases_by_step[step_idx] if t.category == "fuzz"]
+            if not tcs:
+                continue
+            step = self.pipeline.steps[step_idx]
+            method_name = _sanitize_method(step.name)
+
+            param_rows = []
+            for tc in tcs:
+                input_json = json.dumps(tc.input_data, ensure_ascii=False)
+                assertion = tc.assertion_logic.replace('"', '\\"').replace('\n', ' ')
+                # 使用 json.dumps 二次序列化确保安全嵌入
+                safe_input = json.dumps(input_json, ensure_ascii=False)
+                safe_assertion = json.dumps(assertion, ensure_ascii=False)
+                param_rows.append(
+                    f'        ("{tc.case_id}", "{tc.case_name}", '
+                    f'{safe_input}, {tc.expected_status_code}, '
+                    f'{safe_assertion}),'
+                )
+
+            http_method = step.config.method.lower()
+
+            methods.append(f'''    @pytest.mark.parametrize(
+        "case_id,case_name,input_data_json,expected_status,assertion",
+        [
+{chr(10).join(param_rows)}
+        ],
+    )
+    @pytest.mark.fuzz
+    def test_fuzz_step{step_idx + 1}_{method_name}(
+        self, login_session, base_url, api_headers,
+        case_id, case_name, input_data_json, expected_status, assertion,
+    ):
+        """步骤{step_idx + 1}({step.name}) 模糊测试 — 自动边界/注入探测"""
+        input_data = json.loads(input_data_json)
+        body = {{**self._step{step_idx + 1}_base_body(), **input_data}}
+        url = self._step{step_idx + 1}_url(base_url)
+
+        resp = login_session.{http_method}(url, json=body, headers=api_headers)
+        result = resp.json() if resp.text else {{}}
+
+        # 模糊测试宽松断言：核心目标是发现服务端崩溃
+        if resp.status_code >= 500:
+            pytest.fail(
+                f"[{{case_id}}] 模糊测试触发服务端异常! "
+                f"HTTP {{resp.status_code}}, body={{str(result)[:300]}}"
+            )
+        elif resp.status_code == 200:
+            # 服务正常响应即可，不校验业务 code
+            assert isinstance(result, dict), (
+                f"[{{case_id}}] 响应不是 JSON 对象: {{type(result).__name__}}"
+            )
+        else:
+            # 4xx 等客户端错误在模糊测试中可接受
+            pass
+        print(f"[{{case_id}}] {{case_name}}: HTTP={{resp.status_code}}")
 ''')
         return methods
 
@@ -643,6 +762,11 @@ def api_headers(env_config):
 
         lines.append('')
 
+        # 前置钩子
+        pre_code = _render_hook_code(tc.pre_condition)
+        if pre_code:
+            lines.append(pre_code)
+
         # HTTP 请求
         lines.append(f'        resp = login_session.{http_method}(url, json=body, headers=headers)')
         lines.append(f'        result = resp.json() if resp.text else {{}}')
@@ -661,6 +785,11 @@ def api_headers(env_config):
         if extract_code:
             lines.append('        # 提取数据供后续步骤使用')
             lines.append(extract_code)
+
+        # 后置钩子
+        post_code = _render_hook_code(tc.post_condition)
+        if post_code:
+            lines.append(post_code)
 
         # Teardown（仅 POST/PUT 写操作）
         if http_method in ('post', 'put') and tc.category == 'positive':

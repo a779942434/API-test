@@ -183,7 +183,7 @@ def _call_deepseek(api_key: str, system_prompt: str, user_prompt: str, model: st
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": 8192,  # DeepSeek 最大输出 8K tokens
+            "max_tokens": 393216,  # DeepSeek 输出 token 上限
             "temperature": 0.1,
         },
         timeout=120,
@@ -369,7 +369,7 @@ def generate_pipeline_test_cases(
     data_dependencies 存入 TestCase 对象，不再修改 pipeline 原始配置，
     由 runner 在执行时动态应用。
 
-    当 DeepSeek 输出超过 8192 token 上限被截断时，自动发起续写请求补齐缺失用例。
+    当 DeepSeek 输出超过 token 上限被截断时，自动发起续写请求补齐缺失用例。
     """
     api_key = _get_api_key()
     provider = _detect_provider(api_key)

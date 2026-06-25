@@ -271,3 +271,66 @@ def generate_json_report(result: PipelineResult) -> dict:
         },
         "step_results": step_results,
     }
+
+
+def generate_junit_report(result: PipelineResult, pipeline_name: str = "") -> str:
+    """生成 JUnit XML 格式的测试报告。
+
+    Args:
+        result: Pipeline 执行结果
+        pipeline_name: 管道名称（为空则从 result 取）
+
+    Returns:
+        格式化的 JUnit XML 字符串，可直接写入 .xml 文件。
+    """
+    from xml.etree.ElementTree import Element, SubElement, tostring
+    from xml.dom import minidom
+
+    name = pipeline_name or result.pipeline_name
+    total = 0
+    failed = 0
+    total_time_ms = 0.0
+
+    for sr in result.step_results:
+        for tr in sr.test_results:
+            total += 1
+            total_time_ms += tr.response_time_ms
+            if not tr.passed:
+                failed += 1
+
+    testsuite = Element("testsuite", {
+        "name": name,
+        "tests": str(total),
+        "failures": str(failed),
+        "errors": "0",
+        "skipped": "0",
+        "time": f"{total_time_ms / 1000:.3f}",
+    })
+
+    for sr in result.step_results:
+        for tr in sr.test_results:
+            classname = f"Pipeline.{sr.step_name}"
+            test_name = f"{tr.case_id} — {tr.case_name}"
+            testcase = SubElement(testsuite, "testcase", {
+                "classname": classname,
+                "name": test_name,
+                "time": f"{tr.response_time_ms / 1000:.3f}",
+            })
+            if not tr.passed:
+                failure_text = tr.error_message or f"预期 HTTP {tr.expected_status_code}, 实际 {tr.actual_status_code}"
+                failure = SubElement(testcase, "failure", {
+                    "message": failure_text[:200],
+                    "type": "AssertionError",
+                })
+                failure.text = json.dumps({
+                    "case_id": tr.case_id,
+                    "case_name": tr.case_name,
+                    "expected_status": tr.expected_status_code,
+                    "actual_status": tr.actual_status_code,
+                    "error": tr.error_message,
+                    "request_url": tr.request_url,
+                    "request_body": tr.request_body,
+                }, ensure_ascii=False, indent=2)
+
+    xml_str = tostring(testsuite, encoding="unicode")
+    return minidom.parseString(xml_str).toprettyxml(indent="  ")

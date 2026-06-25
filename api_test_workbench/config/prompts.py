@@ -171,7 +171,12 @@ PIPELINE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
 9. **查询/列表步骤精简**：用户说"传参不变"/"保持不变"的 GET/查询步骤，
    → input_data 严格为 {{}}，生成 1 条核心用例即可（其余 N-1 条复用同一个 input_data）
    → 这类步骤的用例不产生 boundary/equivalence/dependency 变体，全部用 positive list
-   → 只有用户明确要求测查询边界时才给查询步骤生成边界用例"""
+   → 只有用户明确要求测查询边界时才给查询步骤生成边界用例
+	10. **前置/后置钩子（pre_condition/post_condition）**：当测试需要创建依赖数据或清理时，填写为可执行的 JSON HTTP 动作：
+	   → 需要创建测试数据：pre_condition = {"method":"POST","url":"/api/xxx","body":{"name":"test-{{timestamp}}"}}
+	   → 需要清理数据：post_condition = {"method":"DELETE","url":"/api/xxx/{id}","body":{}}
+	   → 不需要任何操作时直接省略这两个字段（不要输出空字符串或"无"）
+	   → 纯查询步骤通常不需要钩子，省略即可"""
 
 
 def build_pipeline_user_prompt(

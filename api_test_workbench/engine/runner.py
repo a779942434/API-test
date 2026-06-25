@@ -213,7 +213,26 @@ def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_con
         result = eval(assertion_logic, {"__builtins__": {}}, safe_context)
         if result:
             return True, ""
-        return False, f"断言失败: {assertion_logic}（响应code={resp_json.get('code')}）"
+        # 构造详细错误信息：包含断言表达式、完整响应体、业务状态码
+        resp_code = resp_json.get('code') if isinstance(resp_json, dict) else 'N/A'
+        resp_msg = resp_json.get('message', '') if isinstance(resp_json, dict) else ''
+        resp_body = json.dumps(resp_json, ensure_ascii=False, indent=2) if isinstance(resp_json, (dict, list)) else str(resp_json)
+        if len(resp_body) > 2000:
+            resp_body = resp_body[:2000] + "\n...（已截断）"
+
+        # 识别负向用例意外通过的情况
+        hint = ""
+        lowered = assertion_logic.lower()
+        if ("!=" in lowered or "not" in lowered) and str(resp_code) == '0' and "'code'" in lowered:
+            hint = "\n⚠️ 负向用例意外通过：API 返回 code=0（业务成功），但断言期望业务失败"
+
+        return False, (
+            f"断言失败: {assertion_logic}\n"
+            f"业务码: code={resp_code}"
+            + (f", message={resp_msg}" if resp_msg else "")
+            + f"\n响应体:\n{resp_body}"
+            + hint
+        )
     except Exception as e:
         # 断言执行异常（如 data 字段是字符串而非对象导致 .get() 失败）
         # 这不影响测试结果——断言失败就是 FAIL
@@ -236,6 +255,61 @@ def _apply_body_deps(template, dep_body):
     if isinstance(dep, (dict, list)):
         return dep  # list/dict 直接替换
     return template
+
+
+def _execute_hook(hook_str: str, session: requests.Session) -> tuple[bool, str]:
+    """解析并执行前置/后置钩子。
+
+    支持两种格式：
+    1. JSON 动作描述: {"method": "POST", "url": "/api/xxx", "body": {...}}
+    2. 纯文本描述: "记录返回的data.id" → 仅记录日志，不执行
+
+    Args:
+        hook_str: pre_condition 或 post_condition 字符串
+        session: 已认证的 Session
+
+    Returns:
+        (success, message) — 钩子失败不抛异常，返回 False + 错误信息
+    """
+    if not hook_str or not hook_str.strip():
+        return True, ""
+
+    # 尝试解析为 JSON 动作
+    try:
+        action = json.loads(hook_str)
+    except (json.JSONDecodeError, TypeError):
+        # 纯文本描述（如 "记录返回的id" 或 "无"）→ 仅记录
+        stripped = hook_str.strip()
+        if stripped and stripped not in ('无', '无需', '无前置条件', '无后置条件'):
+            log.debug("钩子（描述）: %s", stripped[:200])
+        return True, ""
+
+    if not isinstance(action, dict):
+        return True, ""
+
+    method = (action.get("method") or "GET").upper()
+    url = action.get("url", "")
+    body = action.get("body") or action.get("data") or {}
+    headers = action.get("headers", {})
+
+    if not url:
+        log.warning("钩子缺少 url 字段，跳过: %s", hook_str[:100])
+        return True, ""
+
+    try:
+        log.info("🔧 执行钩子: %s %s", method, url[:120])
+        if method == "GET":
+            resp = session.get(url, headers=headers, params=body, timeout=30)
+        else:
+            resp = session.request(method, url, headers=headers, json=body, timeout=30)
+        resp.raise_for_status()
+        log.debug("钩子响应 %s: %s", resp.status_code, str(resp.text)[:200])
+        return True, ""
+    except requests.exceptions.Timeout:
+        return False, f"钩子超时: {method} {url}"
+    except requests.exceptions.RequestException as e:
+        log.warning("钩子执行失败: %s %s → %s", method, url, e)
+        return False, f"钩子失败: {method} {url} → {e}"
 
 
 def run_single_test(
@@ -280,6 +354,11 @@ def run_single_test(
     # Debug: 仅记录 cookie 数量和 header 名称，不打印敏感值
     log.debug("Session cookie count: %d, header names: %s",
               len(session.cookies), list(session.headers.keys()))
+
+    # ── 前置钩子 ──
+    pre_ok, pre_msg = _execute_hook(tc.pre_condition, session)
+    if not pre_ok:
+        log.warning("前置钩子失败: %s", pre_msg)
 
     try:
         log.info("%s %s", method, url[:120])
@@ -334,6 +413,44 @@ def run_single_test(
                     f"响应缺少预期键: {missing_keys}，"
                     f"实际键: {list(resp_json.keys())[:20]}"
                 )
+
+        # ── Schema 响应校验（从 OpenAPI 导入的 Schema 自动生效）──
+        if passed and api_config.response_schema:
+            try:
+                from api_test_workbench.engine.schema_validator import validate_response
+                schema_errors = validate_response(response_json, api_config.response_schema)
+                if schema_errors:
+                    passed = False
+                    assertion_error = (
+                        f"Schema 校验失败 ({len(schema_errors)} 项):\n" +
+                        "\n".join(f"  • {e}" for e in schema_errors[:10])
+                    )
+                    if len(schema_errors) > 10:
+                        assertion_error += f"\n  ... 还有 {len(schema_errors) - 10} 项未显示"
+                    log.warning("Schema 校验发现 %d 个问题", len(schema_errors))
+            except Exception:
+                pass  # Schema 校验失败不影响主流程
+
+        # ── 后置钩子 ──
+        post_ok, post_msg = _execute_hook(tc.post_condition, session)
+        if not post_ok:
+            log.warning("后置钩子失败: %s", post_msg)
+
+        # ── 模糊测试宽松判定 ──
+        # 模糊测试目标：服务不崩溃（HTTP 2xx）即通过，不关注业务 code
+        if tc.category == "fuzz" and not passed:
+            if 200 <= resp.status_code < 300:
+                # 服务正常响应（即使业务 code != 0），视为通过
+                passed = True
+                assertion_error = ""
+                log.info("模糊用例 %s 服务正常响应 HTTP %d，视为通过", tc.case_id, resp.status_code)
+            elif resp.status_code >= 500:
+                # 服务端错误 → 真正的 bug
+                assertion_error = (
+                    f"[模糊测试发现Bug] {assertion_error}\n"
+                    f"服务返回 {resp.status_code}，模糊输入导致服务端异常！"
+                )
+                log.warning("模糊用例 %s 触发服务端 %d 错误！", tc.case_id, resp.status_code)
 
         return TestResult(
             case_id=tc.case_id,
@@ -457,157 +574,167 @@ def resolve_step_config(step: ApiStep, context: PipelineContext, env_variables: 
     )
 
 
+def _is_fuzz_case(case_or_result) -> bool:
+    """检查用例或结果是否为模糊测试（通过 case_id 前缀判断）。
+
+    适用于 TestCase 和 TestResult（两者都有 case_id 属性）。
+    模糊测试用例的 case_id 以 'FZ_' 开头，由 engine/fuzzer.py 生成。
+    """
+    cid = getattr(case_or_result, 'case_id', '')
+    return isinstance(cid, str) and cid.startswith('FZ_')
+
+
 def execute_pipeline(
     pipeline: Pipeline,
     session: requests.Session,
     test_cases_by_step: dict,
     progress_callback=None,
     env_variables: dict = None,
+    max_workers: int = 5,
 ) -> PipelineResult:
-    """按用例链路执行 Pipeline：每条用例依次走完所有步骤。
-
-    Args:
-        pipeline: Pipeline 定义
-        session: 已认证的 requests.Session
-        test_cases_by_step: {step_index: [TestCase, ...]}
-        progress_callback: callable(step_idx, total_steps, StepResult)
-        env_variables: 环境变量映射 {"VAR_NAME": "value", ...}，用于 {{VAR}} 替换
-
-    Returns:
-        PipelineResult: 包含所有步骤结果的聚合结果
-    """
+    """执行 Pipeline：步骤顺序执行，同一步骤内多用例并行执行。"""
     total_steps = len(pipeline.steps)
-    # 取各步骤最大用例数
     max_cases = max((len(v) for v in test_cases_by_step.values()), default=0)
     if max_cases == 0:
         return PipelineResult(pipeline_name=pipeline.name, overall_passed=True)
 
-    # 按步骤汇总结果
-    step_results_map = {i: [] for i in range(total_steps)}  # step_idx → [TestResult, ...]
+    step_results_map = {i: [] for i in range(total_steps)}
     overall_passed = True
     stopped_at = -1
 
-    for case_idx in range(max_cases):
-        log.info("===== 链路 %d/%d 开始 =====", case_idx + 1, max_cases)
-        context = PipelineContext()
-        case_stopped = False
+    # ── 并行/串行分发 ──
+    if max_workers > 1 and max_cases > 1:
+        _execute_pipeline_parallel(
+            pipeline, session, test_cases_by_step, env_variables,
+            max_workers, progress_callback, step_results_map,
+        )
+        # 汇总并行模式的 overall_passed 和 stopped_at
+        overall_passed = True
+        stopped_at = -1
+        for step_idx in range(total_steps):
+            results = step_results_map.get(step_idx, [])
+            if not results and step_idx < total_steps:
+                # 步骤被中断（on_failure=stop 触发）
+                if stopped_at < 0:
+                    stopped_at = step_idx
+            for r in results:
+                if not r.passed:
+                    # 模糊测试失败不影响 overall_passed（与串行模式一致）
+                    if not _is_fuzz_case(r):
+                        overall_passed = False
+    else:
+        # 串行模式
+        for case_idx in range(max_cases):
+            log.info("===== 链路 %d/%d 开始 =====", case_idx + 1, max_cases)
+            context = PipelineContext()
+            case_stopped = False
 
-        for step_idx, step in enumerate(pipeline.steps):
-            # 忽略的步骤：跳过执行但保留数据传递
-            if step.ignored:
-                step_results_map[step_idx].append(TestResult(
-                    case_id="", case_name=f"(已忽略)", passed=True,
-                    actual_status_code=0, expected_status_code=0, response_body=None,
-                    response_time_ms=0.0,
-                ))
-                # 填充空上下文，标记为已忽略（下游引用时给出明确提示）
-                context.extracted_values[step_idx] = {"_ignored": True}
-                log.debug("Step %d 已忽略，填充空上下文", step_idx + 1)
-                continue
+            for step_idx, step in enumerate(pipeline.steps):
+                if step.ignored:
+                    step_results_map[step_idx].append(TestResult(
+                        case_id="", case_name="(已忽略)", passed=True,
+                        actual_status_code=0, expected_status_code=0, response_body=None,
+                        response_time_ms=0.0,
+                    ))
+                    context.extracted_values[step_idx] = {"_ignored": True}
+                    continue
 
-            step_tcs = test_cases_by_step.get(step_idx, [])
-            if not step_tcs:
-                continue
-            # 该步骤用例数不足时复用最后一条
-            tc_idx = min(case_idx, len(step_tcs) - 1)
-            if tc_idx != case_idx:
-                log.info("Step %d 用例数(%d)不足，链路 %d 复用用例 #%d", step_idx + 1, len(step_tcs), case_idx + 1, tc_idx)
-            tc = step_tcs[tc_idx]
+                step_tcs = test_cases_by_step.get(step_idx, [])
+                if not step_tcs:
+                    continue
+                tc_idx = min(case_idx, len(step_tcs) - 1)
+                if tc_idx != case_idx:
+                    log.info("Step %d 用例数(%d)不足，链路 %d 复用用例 #%d",
+                             step_idx + 1, len(step_tcs), case_idx + 1, tc_idx)
+                tc = step_tcs[tc_idx]
 
-            try:
-                # progress_callback 移入 try 块内，避免回调异常导致 pipeline 崩溃
-                if progress_callback:
-                    try:
-                        progress_callback(step_idx, total_steps,
-                            StepResult(step_index=step_idx, step_name=step.name, test_results=[]))
-                    except Exception:
-                        pass
-
-                resolved_config = resolve_step_config(step, context, env_variables)
-
-                # 应用 data_dependencies
-                tc_config = resolved_config
-                deps = getattr(tc, 'data_dependencies', {}) or {}
-                if deps:
-                    # 安全解析 headers JSON
-                    dep_headers = {}
-                    if deps.get("headers"):
+                try:
+                    if progress_callback:
                         try:
-                            dep_headers = json.loads(deps["headers"]) if isinstance(deps["headers"], str) else deps["headers"]
-                        except (json.JSONDecodeError, TypeError) as e:
-                            log.warning("data_dependencies.headers 解析失败: %s", e)
-                    tc_config = ApiConfig(
-                        name=resolved_config.name,
-                        url=deps.get("url", resolved_config.url),
-                        method=resolved_config.method,
-                        headers=({**resolved_config.headers, **dep_headers} if dep_headers else resolved_config.headers),
-                        body_template=_apply_body_deps(resolved_config.body_template, deps.get("body")),
-                    )
-                    tc_config = resolve_step_config(
-                        ApiStep(name=tc.case_name, config=tc_config), context, env_variables
+                            progress_callback(step_idx, total_steps,
+                                StepResult(step_index=step_idx, step_name=step.name, test_results=[]))
+                        except Exception:
+                            pass
+
+                    resolved_config = resolve_step_config(step, context, env_variables)
+                    tc_config = resolved_config
+                    deps = getattr(tc, 'data_dependencies', {}) or {}
+                    if deps:
+                        dep_headers = {}
+                        if deps.get("headers"):
+                            try:
+                                dep_headers = json.loads(deps["headers"]) if isinstance(deps["headers"], str) else deps["headers"]
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        tc_config = ApiConfig(
+                            name=resolved_config.name,
+                            url=deps.get("url", resolved_config.url),
+                            method=resolved_config.method,
+                            headers=({**resolved_config.headers, **dep_headers} if dep_headers else resolved_config.headers),
+                            body_template=_apply_body_deps(resolved_config.body_template, deps.get("body")),
+                            response_schema=step.config.response_schema,
+                        )
+                        tc_config = resolve_step_config(
+                            ApiStep(name=tc.case_name, config=tc_config), context, env_variables
+                        )
+
+                    resolved_input = resolve_placeholders(tc.input_data, context)
+                    resolved_tc = TestCase(
+                        case_id=tc.case_id, case_name=tc.case_name,
+                        operation=tc.operation, category=tc.category,
+                        input_data=resolved_input if isinstance(resolved_input, dict) else {},
+                        expected_status_code=tc.expected_status_code,
+                        expected_response_keys=tc.expected_response_keys,
+                        assertion_logic=tc.assertion_logic,
+                        pre_condition=tc.pre_condition,
+                        post_condition=tc.post_condition,
                     )
 
-                resolved_input = resolve_placeholders(tc.input_data, context)
-                resolved_tc = TestCase(
-                    case_id=tc.case_id,
-                    case_name=tc.case_name,
-                    operation=tc.operation,
-                    category=tc.category,
-                    input_data=resolved_input if isinstance(resolved_input, dict) else {},
-                    expected_status_code=tc.expected_status_code,
-                    expected_response_keys=tc.expected_response_keys,
-                    assertion_logic=tc.assertion_logic,
-                    pre_condition=tc.pre_condition,
-                    post_condition=tc.post_condition,
-                )
+                    result = run_single_test(resolved_tc, tc_config, session, step_context=context.extracted_values)
+                    log.info("链路 %d Step %d [%s] %s → %s",
+                             case_idx + 1, step_idx + 1, tc.case_name,
+                             "PASS" if result.passed else "FAIL", result.actual_status_code)
+                    step_results_map[step_idx].append(result)
 
-                result = run_single_test(resolved_tc, tc_config, session, step_context=context.extracted_values)
-                log.info("链路 %d Step %d [%s] %s → %s",
-                         case_idx + 1, step_idx + 1, tc.case_name,
-                         "PASS" if result.passed else "FAIL", result.actual_status_code)
-                step_results_map[step_idx].append(result)
+                    if isinstance(result.response_body, dict):
+                        context.extracted_values[step_idx] = _flatten_response(result.response_body)
+                    elif isinstance(result.response_body, list):
+                        context.extracted_values[step_idx] = _flatten_response(result.response_body, "response")
+                    elif result.response_body is not None:
+                        context.extracted_values[step_idx] = {"response.raw": str(result.response_body)[:200]}
+                    else:
+                        context.extracted_values[step_idx] = {}
 
-                # 提取响应数据给下游步骤（断言失败时也提取，因为业务失败不代表没数据）
-                if isinstance(result.response_body, dict):
-                    context.extracted_values[step_idx] = _flatten_response(result.response_body)
-                elif isinstance(result.response_body, list):
-                    # P0#4: JSON 数组响应保留结构化路径，如 response[0].id
-                    context.extracted_values[step_idx] = _flatten_response(
-                        result.response_body, "response"
-                    )
-                elif result.response_body is not None:
-                    context.extracted_values[step_idx] = {"response.raw": str(result.response_body)[:200]}
-                else:
+                    if not result.passed:
+                        # 模糊测试失败不中断 Pipeline，也不影响 overall_passed
+                        if not _is_fuzz_case(tc):
+                            overall_passed = False
+                            if step.on_failure == "stop":
+                                case_stopped = True
+                                if stopped_at < 0:
+                                    stopped_at = step_idx
+
+                except Exception as e:
+                    log.error("链路 %d Step %d 异常: %s", case_idx + 1, step_idx + 1, str(e))
+                    step_results_map[step_idx].append(TestResult(
+                        case_id=tc.case_id, case_name=tc.case_name,
+                        passed=False, actual_status_code=0,
+                        expected_status_code=tc.expected_status_code,
+                        response_body=None,
+                        error_message=f"步骤执行异常: {str(e)}\n{traceback.format_exc()}",
+                        response_time_ms=0.0,
+                    ))
                     context.extracted_values[step_idx] = {}
-
-                if not result.passed:
                     overall_passed = False
                     if step.on_failure == "stop":
                         case_stopped = True
                         if stopped_at < 0:
                             stopped_at = step_idx
 
-            except Exception as e:
-                log.error("链路 %d Step %d 异常: %s", case_idx + 1, step_idx + 1, str(e))
-                step_results_map[step_idx].append(TestResult(
-                    case_id=tc.case_id, case_name=tc.case_name,
-                    passed=False, actual_status_code=0,
-                    expected_status_code=tc.expected_status_code,
-                    response_body=None,
-                    error_message=f"步骤执行异常: {str(e)}\n{traceback.format_exc()}",
-                    response_time_ms=0.0,
-                ))
-                context.extracted_values[step_idx] = {}
-                overall_passed = False
-                if step.on_failure == "stop":
-                    case_stopped = True
-                    if stopped_at < 0:
-                        stopped_at = step_idx
+                if case_stopped:
+                    break
 
-            if case_stopped:
-                break
-
-    # 汇总 StepResult
+    # ── 汇总 StepResult ──
     step_results = []
     for step_idx, step in enumerate(pipeline.steps):
         results = step_results_map.get(step_idx, [])
@@ -631,9 +758,183 @@ def execute_pipeline(
             extracted_data=extracted,
         ))
 
-    return PipelineResult(
+    pipeline_result = PipelineResult(
         pipeline_name=pipeline.name,
         step_results=step_results,
         overall_passed=overall_passed,
         stopped_at_step=stopped_at,
     )
+
+    try:
+        from api_test_workbench.engine.history import record_run
+        env = (env_variables or {}).get("ENV_NAME", "")
+        record_run(pipeline.name, env, pipeline_result)
+    except Exception:
+        pass
+
+    return pipeline_result
+
+
+def _execute_pipeline_parallel(
+    pipeline, session, test_cases_by_step, env_variables,
+    max_workers, progress_callback, step_results_map,
+):
+    """并行执行：步骤顺序执行，步骤内用例并行。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    total_steps = len(pipeline.steps)
+    accumulated_context = {}  # step_idx → flattened_response
+
+    for step_idx, step in enumerate(pipeline.steps):
+        step_tcs = test_cases_by_step.get(step_idx, [])
+
+        if step.ignored:
+            for tc in step_tcs:
+                step_results_map[step_idx].append(TestResult(
+                    case_id=tc.case_id if tc else "", case_name="(已忽略)", passed=True,
+                    actual_status_code=0, expected_status_code=0, response_body=None,
+                    response_time_ms=0.0,
+                ))
+            accumulated_context[step_idx] = {"_ignored": True}
+            continue
+
+        if not step_tcs:
+            continue
+
+        workers = min(max_workers, len(step_tcs))
+        log.info("===== Step %d/%d (%s): %d 用例, %d 并行 =====",
+                 step_idx + 1, total_steps, step.name, len(step_tcs), workers)
+
+        # 步骤级占位符解析
+        context = PipelineContext()
+        context.extracted_values = accumulated_context
+        try:
+            resolved_config = resolve_step_config(step, context, env_variables)
+            base_url = resolved_config.url
+            base_headers = resolved_config.headers
+            base_body = resolved_config.body_template
+        except Exception as e:
+            log.warning("占位符解析失败: %s", e)
+            base_url = step.config.url
+            base_headers = step.config.headers
+            base_body = step.config.body_template
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for tc in step_tcs:
+                worker_session = _copy_session(session)
+                future = executor.submit(
+                    _run_one_case,
+                    tc, step, base_url, base_headers, base_body,
+                    worker_session, accumulated_context, env_variables,
+                )
+                futures[future] = tc
+
+            for future in as_completed(futures):
+                tc = futures[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    log.error("用例 %s 并行异常: %s", tc.case_id, e)
+                    result = TestResult(
+                        case_id=tc.case_id, case_name=tc.case_name,
+                        passed=False, actual_status_code=0,
+                        expected_status_code=tc.expected_status_code,
+                        response_body=None,
+                        error_message=f"并行执行异常: {e}",
+                        request_url=base_url, response_time_ms=0.0,
+                    )
+                step_results_map[step_idx].append(result)
+
+        # 按原始顺序排序
+        tc_order = {tc.case_id: i for i, tc in enumerate(step_tcs)}
+        step_results_map[step_idx].sort(key=lambda r: tc_order.get(r.case_id, 999))
+
+        # 提取数据供后续步骤
+        for r in step_results_map[step_idx]:
+            if r.passed and isinstance(r.response_body, dict):
+                accumulated_context[step_idx] = _flatten_response(r.response_body)
+                log.debug("Step %d 提取数据来源: [%s] %s", step_idx + 1, r.case_id, r.case_name)
+                break
+        else:
+            accumulated_context[step_idx] = {}
+
+        # 检查是否应中止 Pipeline（非模糊用例全部失败 + on_failure=stop）
+        non_fuzz_results = [r for r in step_results_map[step_idx] if not _is_fuzz_case(r)]
+        if not non_fuzz_results:
+            non_fuzz_results = step_results_map[step_idx]  # 全部是模糊用例，不过滤
+        step_all_failed = all(not r.passed for r in non_fuzz_results)
+        if step_all_failed and step.on_failure == "stop":
+            log.warning("Step %d 全部失败且 on_failure=stop，中止 Pipeline", step_idx + 1)
+            break
+
+        if progress_callback:
+            try:
+                progress_callback(step_idx, total_steps,
+                    StepResult(step_index=step_idx, step_name=step.name,
+                               test_results=step_results_map[step_idx]))
+            except Exception:
+                pass
+
+
+def _copy_session(session: requests.Session) -> requests.Session:
+    """复制 Session：拷贝 cookies 和 headers，线程安全。"""
+    import requests as _r
+    new_s = _r.Session()
+    new_s.cookies.update(session.cookies)
+    new_s.headers.update(session.headers)
+    return new_s
+
+
+def _run_one_case(tc, step, base_url, base_headers, base_body,
+                  session, accumulated_context, env_variables):
+    """执行单条用例（供并行调度）。"""
+    context = PipelineContext()
+    context.extracted_values = accumulated_context
+
+    deps = getattr(tc, 'data_dependencies', {}) or {}
+    tc_config = ApiConfig(
+        url=deps.get("url", base_url),
+        method=step.config.method,
+        headers=dict(base_headers) if isinstance(base_headers, dict) else {},
+        body_template=base_body if isinstance(base_body, (dict, list)) else {},
+        response_schema=step.config.response_schema,
+    )
+
+    if deps:
+        dep_headers = {}
+        if deps.get("headers"):
+            try:
+                dep_headers = json.loads(deps["headers"]) if isinstance(deps["headers"], str) else deps["headers"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if dep_headers:
+            tc_config.headers.update(dep_headers)
+        try:
+            dep_body = deps.get("body", "")
+            if dep_body:
+                dep_body_data = json.loads(dep_body) if isinstance(dep_body, str) else dep_body
+                tc_config.body_template = _apply_body_deps(base_body, dep_body_data)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        try:
+            tc_config = resolve_step_config(
+                ApiStep(name=tc.case_name, config=tc_config), context, env_variables
+            )
+        except Exception:
+            pass
+
+    resolved_input = resolve_placeholders(tc.input_data, context)
+    resolved_tc = TestCase(
+        case_id=tc.case_id, case_name=tc.case_name,
+        operation=tc.operation, category=tc.category,
+        input_data=resolved_input if isinstance(resolved_input, dict) else {},
+        expected_status_code=tc.expected_status_code,
+        expected_response_keys=tc.expected_response_keys,
+        assertion_logic=tc.assertion_logic,
+        pre_condition=tc.pre_condition,
+        post_condition=tc.post_condition,
+    )
+
+    return run_single_test(resolved_tc, tc_config, session, step_context=context.extracted_values)
+

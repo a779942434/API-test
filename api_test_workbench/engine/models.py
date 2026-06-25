@@ -14,6 +14,7 @@ class ApiConfig:
     body_template: dict = field(default_factory=dict)
     auth_endpoint: str = ""
     auth_body: dict = field(default_factory=dict)
+    response_schema: dict = field(default_factory=dict)  # OpenAPI 响应 Schema，用于自动校验
 
 
 @dataclass
@@ -22,7 +23,7 @@ class TestCase:
     case_id: str
     case_name: str
     operation: str  # create|read|update|delete|list
-    category: str   # positive|negative|boundary|equivalence|dependency
+    category: str   # positive|negative|boundary|equivalence|dependency|fuzz
     input_data: dict
     expected_status_code: int
     expected_response_keys: list = field(default_factory=list)

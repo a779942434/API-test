@@ -24,11 +24,15 @@ from api_test_workbench.engine.runner import (
 from api_test_workbench.engine.bindings import scan_placeholders
 from api_test_workbench.engine.curl_parser import parse_curl
 from api_test_workbench.engine.exporter import PytestExporter, _sanitize_filename
-from api_test_workbench.engine.reporter import generate_html_report, generate_json_report
+from api_test_workbench.engine.reporter import generate_html_report, generate_json_report, generate_junit_report
 from api_test_workbench.engine.environment import (
     init_default_environments, list_environments,
     save_environment, delete_environment,
     resolve_env_variables,
+)
+from api_test_workbench.engine.fuzzer import (
+    generate_fuzz_cases, generate_fuzz_cases_for_pipeline,
+    merge_fuzz_cases, get_fuzz_stats,
 )
 
 st.set_page_config(page_title="API 测试工作台 — Pipeline", layout="wide")
@@ -400,6 +404,16 @@ def _scan_all_bindings(pipeline: Pipeline) -> list[DataBinding]:
     return bindings
 
 
+def _estimate_duration(results: list) -> str:
+    """估算执行耗时"""
+    if not results:
+        return "0s"
+    total = sum(r.get("response_time_ms", 0) for r in results)
+    if total < 1000:
+        return f"{total:.0f}ms"
+    return f"{total/1000:.1f}s"
+
+
 # ==================== 环境管理（侧边栏） ====================
 
 _init_session_state()
@@ -570,6 +584,80 @@ with st.sidebar:
             for k, v in st.session_state.env_variables.items():
                 st.caption(f"`{{{{{k}}}}}` → `{v}`")
 
+    # ── 执行历史 ──
+    st.divider()
+    with st.expander("📊 执行历史", expanded=False):
+        try:
+            from api_test_workbench.engine.history import list_runs, get_run_detail, get_summary_stats, cleanup_old
+            cleanup_old()  # 静默清理过期记录
+
+            stats = get_summary_stats()
+            if stats["total_runs"] == 0:
+                st.caption("暂无执行记录，运行一次测试后自动记录")
+            else:
+                col1, col2, col3 = st.columns(3)
+                col1.metric("执行次数", stats["total_runs"])
+                col2.metric("测试总数", stats["total_tests"])
+                col3.metric("平均通过率", f"{stats['avg_pass_rate']}%")
+
+                runs = list_runs(limit=15)
+                if runs:
+                    # 构建选项: "2025-06-25 10:30 | 我的管道 (5/5 通过)"
+                    options = []
+                    run_map = {}
+                    for r in runs:
+                        ts = r["started_at"][:16] if r["started_at"] else "?"
+                        env_tag = f" [{r['env_name']}]" if r.get("env_name") else ""
+                        label = f"{ts}{env_tag} | {r['pipeline_name']} ({r['passed']}/{r['total']})"
+                        icon = "✅" if r["overall_passed"] else "❌"
+                        options.append(f"{icon} {label}")
+                        run_map[label] = r["id"]
+
+                    selected = st.selectbox(
+                        "选择执行记录查看详情",
+                        options=options,
+                        label_visibility="collapsed",
+                    )
+                    if selected:
+                        label = selected[2:]  # 去掉图标前缀
+                        run_id = run_map[label]
+                        detail = get_run_detail(run_id)
+                        if detail:
+                            r = detail["run"]
+                            st.caption(f"完成时间: {r['finished_at']} | "
+                                       f"通过: {r['passed']}/{r['total']} | "
+                                       f"耗时约 {_estimate_duration(detail['results'])}")
+
+                            # 用例详情表
+                            rows = []
+                            for tc in detail["results"]:
+                                rows.append({
+                                    "步骤": f"Step{tc['step_idx']+1}: {tc['step_name']}",
+                                    "用例": tc['case_id'],
+                                    "名称": tc['case_name'],
+                                    "结果": "✅" if tc['passed'] else "❌",
+                                    "耗时": f"{tc['response_time_ms']}ms",
+                                    "HTTP": f"{tc['actual_status_code']}/{tc['expected_status_code']}",
+                                })
+                            if rows:
+                                st.dataframe(
+                                    rows,
+                                    width="stretch",
+                                    hide_index=True,
+                                    column_config={
+                                        "步骤": st.column_config.TextColumn(width="small"),
+                                        "用例": st.column_config.TextColumn(width="small"),
+                                        "名称": st.column_config.TextColumn(width="medium"),
+                                        "结果": st.column_config.TextColumn(width="small"),
+                                        "耗时": st.column_config.TextColumn(width="small"),
+                                        "HTTP": st.column_config.TextColumn(width="small"),
+                                    },
+                                )
+        except Exception as e:
+            import logging
+            logging.getLogger("app").warning("执行历史加载失败: %s", e)
+            st.caption("历史记录暂不可用，请稍后重试")
+
 
 
 tab1, tab2 = st.tabs(["🧪 测试流程", "🔧 造数据模式"])
@@ -587,6 +675,104 @@ with tab1:
     steps = st.session_state.pipeline.steps
     if len(steps) >= 1:
         st.markdown(_render_pipeline_flow(steps), unsafe_allow_html=True)
+
+    # ── OpenAPI 导入 ──
+    with st.expander("📥 从 OpenAPI/Swagger 导入", expanded=False):
+        import_mode = st.radio("导入方式", ["上传文件", "URL 获取"], horizontal=True, label_visibility="collapsed")
+
+        spec_content = None
+        is_yaml = False
+
+        if import_mode == "上传文件":
+            uploaded = st.file_uploader(
+                "选择 OpenAPI/Swagger 文件",
+                type=["json", "yaml", "yml"],
+                label_visibility="collapsed",
+            )
+            if uploaded:
+                try:
+                    spec_content = uploaded.read().decode("utf-8")
+                    is_yaml = uploaded.name.endswith((".yaml", ".yml"))
+                except UnicodeDecodeError:
+                    st.error("文件编码不支持，请使用 UTF-8 编码")
+        else:
+            spec_url = st.text_input("OpenAPI 规范 URL", placeholder="https://petstore3.swagger.io/api/v3/openapi.json")
+            if spec_url and st.button("获取", width="stretch"):
+                import requests as _requests
+                from urllib.parse import urlparse
+                try:
+                    parsed = urlparse(spec_url)
+                    if parsed.scheme not in ("https",):
+                        st.error("仅支持 HTTPS URL（安全限制）")
+                    elif parsed.hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+                        st.error("不允许访问本地地址（安全限制）")
+                    elif parsed.hostname and (
+                        parsed.hostname.startswith("10.") or
+                        parsed.hostname.startswith("192.168.") or
+                        parsed.hostname.startswith("172.16.") or
+                        parsed.hostname.startswith("169.254.")
+                    ):
+                        st.error("不允许访问内网地址（安全限制）")
+                    else:
+                        r = _requests.get(spec_url, timeout=15)
+                        r.raise_for_status()
+                        spec_content = r.text
+                        is_yaml = spec_url.endswith((".yaml", ".yml"))
+                        st.success(f"获取成功 ({len(spec_content)} 字符)")
+                except Exception as e:
+                    st.error(f"获取失败: {e}")
+
+        if spec_content:
+            try:
+                from api_test_workbench.engine.openapi_parser import parse_spec, list_endpoints, endpoint_to_step, spec_title
+
+                spec = parse_spec(spec_content, is_yaml=is_yaml)
+                endpoints = list_endpoints(spec)
+
+                st.caption(f"📋 {spec_title(spec)} — {len(endpoints)} 个端点")
+
+                # 端点选择器
+                ep_options = {}
+                for ep in endpoints:
+                    label = f"{ep['method']:6} {ep['path']:40} | {ep['summary'][:50]}"
+                    tag_str = ", ".join(ep.get("tags", [])) if ep.get("tags") else ""
+                    if tag_str:
+                        label += f"  [{tag_str}]"
+                    ep_options[label] = ep
+
+                selected = st.multiselect(
+                    "勾选要导入的端点",
+                    options=list(ep_options.keys()),
+                    default=[],
+                    label_visibility="collapsed",
+                )
+
+                col_import, col_clear = st.columns([1, 4])
+                with col_import:
+                    if st.button("📥 导入选中端点", width="stretch", disabled=not selected):
+                        imported = 0
+                        for label in selected:
+                            ep = ep_options[label]
+                            step = endpoint_to_step(spec, ep)
+                            st.session_state.pipeline.steps.append(step)
+                            imported += 1
+                        st.success(f"已导入 {imported} 个端点")
+                        st.rerun()
+                with col_clear:
+                    if st.button("📥 替换全部步骤", width="stretch", disabled=not selected,
+                                 help="清空现有步骤，仅保留导入的端点"):
+                        new_steps = []
+                        for label in selected:
+                            ep = ep_options[label]
+                            step = endpoint_to_step(spec, ep)
+                            new_steps.append(step)
+                        st.session_state.pipeline.steps = new_steps
+                        st.session_state.pipeline_test_cases_by_step = {}
+                        st.success(f"已替换为 {len(new_steps)} 个端点")
+                        st.rerun()
+
+            except Exception as e:
+                st.error(f"解析失败: {e}")
 
     st.markdown("---")
 
@@ -790,7 +976,7 @@ with tab1:
     # 每次渲染后备份字段定义内容（含空值），防止增删步骤时丢失
     _backup_fr()
 
-    gen_col1, gen_col2, _ = st.columns([1.5, 1, 3])
+    gen_col1, gen_col2, fuzz_col1, fuzz_col2 = st.columns([1.5, 1, 1, 1])
     with gen_col1:
         test_cases_per_step = st.number_input(
             "每步用例数", min_value=1, max_value=25, value=1, step=1, key="tc_per_step",
@@ -798,7 +984,17 @@ with tab1:
         )
     with gen_col2:
         st.write("")
-        generate_clicked = st.button("生成测试数据", type="primary", width="stretch")
+        generate_clicked = st.button("🤖 AI生成", type="primary", use_container_width=True)
+    with fuzz_col1:
+        fuzz_intensity = st.selectbox(
+            "模糊强度", options=["light", "standard", "deep"], index=1,
+            key="fuzz_intensity",
+            help="light=快速冒烟(5-8条) | standard=标准覆盖(15-35条) | deep=全量探测(50+条)",
+        )
+    with fuzz_col2:
+        st.write("")
+        fuzz_clicked = st.button("🎲 模糊测试", type="secondary", use_container_width=True,
+                                 help="对 body_template 中每个字段自动生成边界/异常/注入变异值")
 
     if generate_clicked:
         if not st.session_state.field_requirements.strip():
@@ -819,6 +1015,43 @@ with tab1:
                 except Exception as e:
                     st.error(f"生成失败: {e}")
                     st.session_state.pipeline_test_cases_by_step = {}
+
+    if fuzz_clicked:
+        steps = st.session_state.pipeline.steps
+        if not any(s.config.body_template for s in steps):
+            st.warning("请先为步骤配置 Body 模板（至少一个步骤需要有请求体）")
+        else:
+            with st.spinner(f"正在生成模糊测试用例（强度: {fuzz_intensity}）..."):
+                try:
+                    fuzz_cases_by_step = generate_fuzz_cases_for_pipeline(
+                        pipeline_steps=steps,
+                        intensity=fuzz_intensity,
+                    )
+                    if not fuzz_cases_by_step:
+                        st.warning("没有生成模糊用例。请确保步骤已配置 body_template 且为写操作（POST/PUT/PATCH）。")
+                    else:
+                        # 合并到现有用例
+                        existing = st.session_state.get("pipeline_test_cases_by_step", {})
+                        merge_fuzz_cases(existing, fuzz_cases_by_step)
+                        st.session_state.pipeline_test_cases_by_step = existing
+
+                        total_fuzz = sum(len(v) for v in fuzz_cases_by_step.values())
+                        steps_with_fuzz = len(fuzz_cases_by_step)
+
+                        # 展示统计
+                        all_fuzz = []
+                        for cases in fuzz_cases_by_step.values():
+                            all_fuzz.extend(cases)
+                        stats = get_fuzz_stats(all_fuzz)
+
+                        st.success(
+                            f"已为 {steps_with_fuzz} 个步骤生成 {total_fuzz} 条模糊测试用例 | "
+                            f"覆盖字段: {', '.join(stats['by_field'].keys())}"
+                        )
+                except Exception as e:
+                    st.error(f"模糊测试生成失败: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     # 展示 & 编辑测试用例（按步骤 Tab）
     tcs_by_step = st.session_state.pipeline_test_cases_by_step
@@ -854,7 +1087,7 @@ with tab1:
                     column_config={
                         "case_id": st.column_config.TextColumn("ID", width="small"),
                         "case_name": st.column_config.TextColumn("用例名称", width="medium"),
-                        "category": st.column_config.SelectboxColumn("类型", options=["positive", "negative", "boundary", "equivalence", "dependency"], width="small"),
+                        "category": st.column_config.SelectboxColumn("类型", options=["positive", "negative", "boundary", "equivalence", "dependency", "fuzz"], width="small"),
                         "operation": st.column_config.SelectboxColumn("操作", options=["create", "read", "update", "delete", "list"], width="small"),
                         "expected_status": st.column_config.NumberColumn("期望状态码", width="small"),
                         "input_data": st.column_config.TextColumn("请求体 JSON", width="large"),
@@ -936,10 +1169,13 @@ with tab1:
     has_cases = any(len(v) > 0 for v in st.session_state.pipeline_test_cases_by_step.values())
     exec_disabled = not has_cases
 
-    exec_col1, exec_col2, _ = st.columns([1, 1, 3])
+    exec_col1, exec_col2, exec_col3 = st.columns([1, 1, 1])
     with exec_col1:
         run_clicked = st.button("执行 Pipeline", type="primary", width="stretch", disabled=exec_disabled)
     with exec_col2:
+        max_workers = st.number_input("并行数", min_value=1, max_value=20, value=5, step=1,
+                                       help="同一步骤内用例并行执行数，1=串行")
+    with exec_col3:
         # 导出 pytest 按钮
         if has_cases:
             # 使用 expander 避免每次生成 ZIP
@@ -1002,6 +1238,7 @@ with tab1:
                     test_cases_by_step=tcs_by_step,
                     progress_callback=update_progress,
                     env_variables=st.session_state.get("env_variables") or None,
+                    max_workers=max_workers,
                 )
                 st.session_state.pipeline_results = results
 
@@ -1115,11 +1352,11 @@ with tab1:
         # 报告导出按钮
         st.divider()
         st.subheader("📊 报告导出")
-        col_html, col_json, _ = st.columns([1, 1, 3])
+        col_html, col_json, col_junit, _ = st.columns([1, 1, 1, 2])
         with col_html:
             html_report = generate_html_report(pipeline_results, st.session_state.pipeline)
             st.download_button(
-                "📥 下载 HTML 报告",
+                "📥 HTML 报告",
                 data=html_report,
                 file_name=f"api_test_report_{pipeline_results.pipeline_name}.html",
                 mime="text/html",
@@ -1132,11 +1369,21 @@ with tab1:
                 ensure_ascii=False, indent=2,
             )
             st.download_button(
-                "📥 下载 JSON 报告",
+                "📥 JSON 报告",
                 data=json_report,
                 file_name=f"api_test_report_{pipeline_results.pipeline_name}.json",
                 mime="application/json",
                 width="stretch",
+            )
+        with col_junit:
+            junit_report = generate_junit_report(pipeline_results, st.session_state.pipeline.name)
+            st.download_button(
+                "📥 JUnit 报告",
+                data=junit_report,
+                file_name=f"api_test_report_{pipeline_results.pipeline_name}.xml",
+                mime="application/xml",
+                width="stretch",
+                help="标准 JUnit XML 格式，可在 Jenkins/GitLab CI 中直接使用",
             )
 
 
@@ -1307,6 +1554,7 @@ Body 模板（已有默认值，只需随机化用户指定的字段）：{json.
                         session=session,
                         test_cases_by_step=tcs_by_step,
                         progress_callback=update_progress,
+                        max_workers=10,  # 造数据模式多用并行加速
                     )
 
                 progress_bar.empty()
