@@ -72,6 +72,109 @@ def _wrap_step_context(step_context: dict) -> dict:
     return {idx: _StepData(data) for idx, data in step_context.items()}
 
 
+def _run_structured_assertions(
+    assertions: list[dict],
+    assertion_logic: str,
+    resp: requests.Response,
+    step_context: dict = None,
+) -> tuple[bool, str]:
+    """执行结构化断言（新格式）。
+
+    Args:
+        assertions: [{"type": "code_equals", "expected": "0"}, ...]
+        assertion_logic: 旧格式断言字符串（作为 fallback）
+        resp: HTTP 响应
+        step_context: 上游步骤数据
+
+    Returns:
+        (passed, error_message)
+    """
+    from api_test_workbench.engine.assertion_runner import AssertionRunner
+
+    # 解析当前步骤的响应
+    try:
+        response_json = resp.json() if resp.text else {}
+    except Exception:
+        response_json = {}
+
+    # 构建当前步骤的 extracted 数据（从扁平化响应中提取）
+    current_extracted = {
+        "code": str(response_json.get("code", "")) if isinstance(response_json, dict) else "",
+    }
+    # 如果响应有 data 字段，提取常用路径
+    if isinstance(response_json, dict) and "data" in response_json:
+        data = response_json["data"]
+        if isinstance(data, dict):
+            if "total" in data:
+                current_extracted["total"] = str(data["total"])
+            if "records" in data and isinstance(data["records"], list) and data["records"]:
+                current_extracted["first_record_id"] = str(data["records"][0].get("id", ""))
+        elif isinstance(data, list) and data:
+            current_extracted["first_record_id"] = str(data[0].get("id", ""))
+            current_extracted["total"] = str(len(data))
+
+    # 构建 step_results 供 AssertionRunner 使用
+    step_results = {}
+    if step_context:
+        for step_idx, flat_data in step_context.items():
+            # 从扁平化数据中提取常用字段
+            extracted = {}
+            for key in ("response.data.total", "response.data[0].id",
+                        "extract.total", "extract.first_record_id", "extract.new_record_id"):
+                if key in flat_data:
+                    short = key.rsplit(".", 1)[-1]
+                    extracted[short] = str(flat_data[key])
+            # 也查找 dot-path
+            for full_key, value in flat_data.items():
+                if "total" in full_key and "total" not in extracted:
+                    extracted["total"] = str(value)
+                if "[0].id" in full_key and "first_record_id" not in extracted:
+                    extracted["first_record_id"] = str(value)
+            step_results[step_idx] = {
+                "response": response_json if step_idx == 0 else {},
+                "extracted": extracted,
+            }
+    # 添加当前步骤（当前步骤索引假设为 max(step_results)+1 或 0）
+    current_step = max(step_results.keys()) + 1 if step_results else 0
+    step_results[current_step] = {
+        "response": response_json,
+        "extracted": current_extracted,
+    }
+
+    runner = AssertionRunner(step_results)
+
+    try:
+        results = runner.run(
+            assertions=assertions,
+            assertion_logic="",  # 旧格式在外部处理
+            current_step=current_step,
+            current_response=response_json,
+            current_extracted=current_extracted,
+            eval_fn=None,
+        )
+    except Exception as e:
+        # 断言执行异常
+        if assertion_logic:
+            # 回退到旧格式
+            return _safe_eval_assertion(assertion_logic, resp, step_context)
+        return False, f"断言执行异常: {str(e)}"
+
+    # 汇总结果
+    failures = [r for r in results if not r.get("pass", False)]
+    if failures:
+        error_msgs = []
+        for f in failures:
+            if "error" in f:
+                error_msgs.append(f"[{f.get('type')}] {f['error']}")
+            else:
+                error_msgs.append(
+                    f"[{f.get('type')}] expected={f.get('expected')} actual={f.get('actual')}"
+                )
+        return False, " | ".join(error_msgs)
+
+    return True, ""
+
+
 def _safe_eval_assertion(assertion_logic: str, resp: requests.Response, step_context: dict = None) -> tuple[bool, str]:
     """在受限上下文中执行断言逻辑字符串。
 
@@ -399,7 +502,16 @@ def run_single_test(
 
         # 如果状态码通过，执行附加断言
         assertion_error = ""
-        if passed and tc.assertion_logic:
+
+        # ── 新格式：结构化 assertions 数组 ──
+        if passed and tc.assertions:
+            assertion_passed, assertion_error = _run_structured_assertions(
+                tc.assertions, tc.assertion_logic, resp, step_context
+            )
+            passed = assertion_passed
+
+        # ── 旧格式：assertion_logic 字符串（向后兼容）──
+        elif passed and tc.assertion_logic:
             assertion_passed, assertion_error = _safe_eval_assertion(tc.assertion_logic, resp, step_context)
             passed = assertion_passed
 

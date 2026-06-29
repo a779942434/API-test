@@ -1013,6 +1013,9 @@ with tab1:
                     total = sum(len(v) for v in test_cases_by_step.values())
                     st.success(f"已为 {len(test_cases_by_step)} 个步骤生成 {total} 条测试用例")
                 except Exception as e:
+                    from api_test_workbench.engine.logger import setup_logger
+                    log = setup_logger("app")
+                    log.exception("Pipeline 测试用例生成失败")
                     st.error(f"生成失败: {e}")
                     st.session_state.pipeline_test_cases_by_step = {}
 

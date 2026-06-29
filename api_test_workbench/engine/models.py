@@ -27,7 +27,9 @@ class TestCase:
     input_data: dict
     expected_status_code: int
     expected_response_keys: list = field(default_factory=list)
-    assertion_logic: str = ""
+    assertion_logic: str = ""               # 旧格式：Python 表达式字符串（向后兼容）
+    assertions: list = field(default_factory=list)  # 新格式：结构化断言 [{"type":"code_equals", ...}]
+    extract_fields: list = field(default_factory=list)  # 语义化提取字段名 ["total", "first_record_id"]
     pre_condition: str = ""
     post_condition: str = ""
     data_dependencies: dict = field(default_factory=dict)  # {url, body, headers} 运行时注入，不修改用户配置

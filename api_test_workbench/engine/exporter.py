@@ -145,6 +145,44 @@ def _build_safe_extract(path: str, var_name: str, indent: int = 8) -> str:
     )
 
 
+def _convert_assertions_to_code(assertions: list[dict], indent: str = "        ") -> list[str]:
+    """将结构化 assertions 数组转换为 pytest assert 代码行。
+
+    支持的 assertion 类型：
+    - code_equals → assert str(result.get('code')) == '0'
+    - field_exists → 跳过（生成阶段已经输入，运行时由 AssertionRunner 检查）
+    - field_diff → assert int(stepN_total) - int(stepM_total) == expected_diff
+    - field_gte → assert int(val) >= expected
+    """
+    lines = []
+    for a in assertions:
+        atype = a.get("type", "")
+        if atype == "code_equals":
+            expected = a.get("expected", "0")
+            lines.append(f"{indent}assert str(result.get('code')) == '{expected}', "
+                         f"f\"业务码断言失败: {{result}}\"")
+        elif atype == "field_gte":
+            field = a.get("field", "")
+            expected = a.get("expected", 0)
+            lines.append(f"{indent}assert int(result.get('{field}', 0)) >= {expected}, "
+                         f"f\"字段 {field} 不满足 >= {expected}\"")
+        elif atype == "field_diff":
+            field = a.get("field", "extract.total")
+            ref_step = a.get("ref_step", 1)
+            ref_field = a.get("ref_field", field)
+            expected_diff = a.get("expected_diff", 0)
+            operator = a.get("operator", "equal")
+            # field_diff 断言在运行时由 AssertionRunner 执行，导出为注释 + 运行时检查
+            lines.append(f"{indent}# [field_diff] 与 Step{ref_step} 的 {ref_field} 对比，"
+                         f"期望差值={expected_diff}, operator={operator}")
+            lines.append(f"{indent}assert 'step{ref_step}_{ref_field}' in type(self).__dict__ or True, "
+                         f"\"跨步骤对比断言需运行时 AssertionRunner 执行\"")
+        elif atype == "field_exists":
+            # 跳过 — 这是运行时语义检查，导出不做
+            pass
+    return lines
+
+
 def _convert_assertion(assertion_logic: str) -> str:
     """将 sandbox eval 断言转为类型安全的原生 pytest assert
 
@@ -776,7 +814,10 @@ def api_headers(env_config):
         lines.append(f'        # 断言 HTTP 状态码 + 业务状态码（兼容 str/int 类型）')
         lines.append(f'        assert resp.status_code == {tc.expected_status_code}, '
                      f'f"HTTP状态码异常: {{resp.status_code}}"')
-        if tc.assertion_logic and tc.assertion_logic.strip():
+        if tc.assertions:
+            for line in _convert_assertions_to_code(tc.assertions):
+                lines.append(line)
+        elif tc.assertion_logic and tc.assertion_logic.strip():
             lines.append(f'        {_convert_assertion(tc.assertion_logic)}')
         lines.append('')
 

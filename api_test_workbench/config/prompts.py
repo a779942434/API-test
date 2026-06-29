@@ -1,5 +1,7 @@
 """Claude API Prompt 模板 — 复用 CLAUDE.md 中的测试用例生成规则"""
 
+from __future__ import annotations
+
 import json
 
 
@@ -20,6 +22,7 @@ def _extract_keys(obj, prefix="") -> list[str]:
     elif isinstance(obj, list) and obj:
         keys.extend(_extract_keys(obj[0], prefix))
     return keys
+
 
 SYSTEM_PROMPT = """你是一名资深自动化测试专家与数据质量架构师，精通等价类划分、边界值分析、API 契约测试与测试数据工程。
 你的任务是根据用户提供的【接口字段定义】，自动生成高质量、可直接用于自动化测试脚本的测试用例与测试数据。
@@ -109,102 +112,157 @@ API 响应约定：
 8. 仅输出 JSON，确保可被 json.loads() 直接解析"""
 
 
+# ==================== 步骤类型分类规则 ====================
+
+STEP_TYPE_RULES = {
+    "extractor": {
+        "count": 2,
+        "desc": "仅查询获取数据，不验证变化",
+        "keywords": ["传参不变", "保持不变", "仅查询", "仅获取", "查询接口", "不做修改"],
+        "case_desc": "1条正常查询 + 1条空结果边界",
+    },
+    "mutation": {
+        "count": 10,
+        "desc": "创建/更新/删除操作，需覆盖字段边界",
+        "keywords": ["创建", "新增", "编辑", "修改", "删除", "POST", "PUT", "DELETE"],
+        "case_desc": "1条正向 + 必填字段边界 + 字符串上限边界 + 异常/非法值 + 等价类组合",
+    },
+    "verifier": {
+        "count": 5,
+        "desc": "查询并对比前后数据变化",
+        "keywords": ["对比", "增加了", "减少了", "是否增加", "是否减少", "验证", "校验变化"],
+        "case_desc": "含跨步骤对比断言 + 边界场景",
+    },
+}
+
+
 # ==================== Pipeline 模式 Prompt ====================
 
-PIPELINE_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+PIPELINE_SYSTEM_PROMPT = """# 角色
+你是API测试用例生成专家。根据Pipeline描述为多步骤API链路生成结构化测试用例。
 
-## Pipeline 模式（多步骤 API 链路测试）
+# 核心规则
 
-你现在为多步骤 API Pipeline 生成测试用例。每个步骤是独立的 API 接口，前一步的输出是后一步的输入（步骤间通过 data_dependencies 传递数据）。
+## 1. 步骤分类与用例数量（必须先分类再生成）
+用户已在输入中指定每步类型和用例数，你必须严格遵循：
+| 步骤类型 | 用例数 | 说明 |
+|---------|-------|------|
+| extractor | 2条 | 仅查询获取数据，不验证变化；1条正常 + 1条空结果边界 |
+| mutation  | 10条 | 创建/更新/删除；覆盖必填边界、字符串上限、异常值、等价类 |
+| verifier  | 5条 | 查询+对比前后变化；含跨步骤断言 + 边界场景 |
 
-输出结构（Pipeline 模式）：
+## 2. 每条用例的 JSON 结构
 {
-  "pipeline_name": "string",
+  "case_id": "TC_001",
+  "case_name": "正向-正常查询",
+  "operation": "create|read|update|delete|list",
+  "category": "positive|negative|boundary|equivalence|dependency",
+  "input_data": {},
+  "expected_status_code": 200,
+  "assertions": [
+    {"type": "code_equals", "expected": "0"}
+  ],
+  "extract_fields": ["total", "first_record_id"],
+  "data_dependencies": {}
+}
+
+## 3. input_data 规则
+- extractor/verifier 步骤（用户说"传参不变"）：input_data 严格为 {}
+- mutation 步骤：只放用户明确要修改/随机化的字段
+- 用户没提到的字段不要放入 input_data
+- 名称/编码字段值追加 {{timestamp}} 保证唯一性
+- 纯数字、布尔值、空字符串不追加时间戳
+
+## 4. 语义化数据引用（禁止猜测响应JSON结构！）
+使用 {{stepN.extract.FIELD_NAME}} 格式引用前序步骤提取的数据：
+  ✅ {{step3.extract.first_record_id}}   // 语义化
+  ✅ {{step1.extract.total}}            // 语义化
+  ❌ {{step3.response.data.records[0].id}}  // 禁止猜测物理路径
+
+FIELD_NAME 必须是用户描述中提到的业务字段名，常见映射：
+  - "获取返回的total" → extract_fields: ["total"]
+  - "获取id作为编辑id" → extract_fields: ["first_record_id"]
+  - "获取返回的新记录id" → extract_fields: ["new_record_id"]
+
+## 5. 结构化断言（必须用 assertions 数组，不再用 assertion_logic 字符串）
+支持类型：
+
+**响应码断言**：
+  {"type": "code_equals", "expected": "0"}
+
+**字段存在断言**：
+  {"type": "field_exists", "path": "extract.total"}
+
+**跨步骤对比断言（关键！用于 verifier 步骤）**：
+  {"type": "field_diff", "field": "extract.total",
+   "ref_step": 1, "ref_field": "extract.total",
+   "operator": "equal", "expected_diff": 1}
+
+operator 取值：equal（差值等于expected_diff）、gt（大于）、lt（小于）、gte、lte
+
+## 6. API 约定
+- 所有接口返回 HTTP 200
+- 业务成功：code == "0"（可能是字符串或整数）
+- data 字段可能是对象 {records:[...]} 或数组 [...]，也可能是字符串
+
+## 7. 输出要求
+- 严格输出 JSON，不要 Markdown 代码块
+- 每个步骤生成恰好指定数量的用例，不多不少
+- 输出结构：
+{
+  "expected_total": 42,
+  "notes": "extractor:2×2=4, mutation:10×2=20, verifier:5×2=10, 实际少step4=10条故42",
   "steps": [
     {
-      "step_name": "string",
-      "test_cases": [
-        {
-          "case_id": "string",
-          "case_name": "string",
-          "operation": "create|read|update|delete|list",
-          "category": "positive|negative|boundary|equivalence|dependency",
-          "input_data": {},
-          "expected_status_code": 200,
-          "expected_response_keys": ["string"],
-          "assertion_logic": "string",
-          "pre_condition": "string",
-          "post_condition": "string",
-          "data_dependencies": {
-            "url": "string (optional, with {{stepN.response.path}} placeholders)",
-            "body": "string (optional, with placeholders)",
-            "headers": "string (optional, with placeholders)"
-          }
-        }
-      ],
-      "output_reference": "data.records[0].id"
+      "step_name": "...",
+      "step_type": "extractor",
+      "test_cases": [...]
     }
   ]
 }
+- 精简输出：空字符串/空数组/空对象字段直接省略"""
 
-核心规则：
-1. **用户描述是最高优先级**：用户说不变的字段不要放入 input_data，用户说要变的才放
-2. **input_data 与 body_template 合并**：最终请求体 = {**body_template, **input_data}，input_data 的同名字段覆盖 body_template
-3. **步骤间数据传递**：用 data_dependencies + {{stepN.response.path}} 占位符，不要放入 input_data
-4. **唯一性**：POST/PUT 的名称/编码字段追加 {timestamp}；GET/查询固定值；纯数字/布尔/空值不加
-5. **响应结构适配**：API 的 data 字段可能是数组 [...] 或对象 {records:[...]}
-   - data 为数组时占位符用 {{{{stepN.response.data[0].id}}}}，断言用 isinstance(data_val, list) 判断
-   - data 为对象时占位符用 {{{{stepN.response.data.records[0].id}}}}，断言用 .get('records',[])
-   - 运行时如果占位符路径未精确匹配，会自动尝试回退路径（移除中间包装段如 records/list/items）
-   - **随机获取**：用 {{{{stepN.response.data.random.id}}}} 每次随机选取一个元素
-   - **指定位置**：用 {{{{stepN.response.data[2].id}}}} 获取第 3 个元素
-   - **数组长度**：用 {{{{stepN.response.data._count}}}} 获取元素个数
-6. **断言**：code 必须用 str() 包裹（兼容 "0" 和 0），data 可能是字符串、列表或对象，不要直接 .id
-7. **动态字段标记**：只有名称/编码等需要唯一性的字段才在 input_data 值中追加 {{{{timestamp}}}}，
-   静态描述字段（如 description: "正常报修"）不需要追加时间戳，保持原值即可
-8. **精简输出（关键）**：每条用例的 JSON 必须尽量精简，以节省 token 避免截断：
-   - 空字符串字段（pre_condition: "", post_condition: ""）直接省略，不要输出
-   - 空数组字段（expected_response_keys: []）直接省略
-   - 空对象字段（data_dependencies: {}）直接省略
-   - input_data 中值为空的字段也省略
-   - 这样每条用例 JSON 可以从 ~1500 字缩减到 ~500 字
-9. **查询/列表步骤精简**：用户说"传参不变"/"保持不变"的 GET/查询步骤，
-   → input_data 严格为 {{}}，生成 1 条核心用例即可（其余 N-1 条复用同一个 input_data）
-   → 这类步骤的用例不产生 boundary/equivalence/dependency 变体，全部用 positive list
-   → 只有用户明确要求测查询边界时才给查询步骤生成边界用例
-	10. **前置/后置钩子（pre_condition/post_condition）**：当测试需要创建依赖数据或清理时，填写为可执行的 JSON HTTP 动作：
-	   → 需要创建测试数据：pre_condition = {"method":"POST","url":"/api/xxx","body":{"name":"test-{{timestamp}}"}}
-	   → 需要清理数据：post_condition = {"method":"DELETE","url":"/api/xxx/{id}","body":{}}
-	   → 不需要任何操作时直接省略这两个字段（不要输出空字符串或"无"）
-	   → 纯查询步骤通常不需要钩子，省略即可"""
 
+# ==================== User Prompt 构建函数 ====================
 
 def build_pipeline_user_prompt(
     pipeline_description: str,
     step_descriptions: list[str],
     steps: list,
     test_cases_per_step: int = 1,
+    step_classifications: list[str] | None = None,
 ) -> str:
     """构造 Pipeline 模式的 User Prompt
 
-    设计原则：用户描述是最高优先级。本提示词只定义输出格式和必要语法，
-    不覆盖用户对字段变更/不变更的意图。
+    Args:
+        pipeline_description: 用户的 Pipeline 描述
+        step_descriptions: 每步描述 ["Step1 — POST /api/xxx", ...]
+        steps: Pipeline 的 ApiStep 列表
+        test_cases_per_step: 用户选择的每步用例数（仅作参考，实际按分类）
+        step_classifications: 预分类结果 ["extractor", "mutation", "verifier", ...]
     """
+    if step_classifications is None:
+        step_classifications = _classify_steps(pipeline_description, steps)
 
+    expected_total = sum(
+        STEP_TYPE_RULES[t]["count"] for t in step_classifications
+    )
+
+    # 构建步骤块
     steps_block_parts = []
     for i, desc in enumerate(step_descriptions):
-        parts = [f"  Step {i+1}：{desc}"]
-        # 附上当前 body_template 的字段名（仅 key，不展示完整值以节省 token）
+        stype = step_classifications[i] if i < len(step_classifications) else "mutation"
+        scount = STEP_TYPE_RULES[stype]["count"]
+        parts = [f"  Step {i+1} [{stype}] ×{scount}条：{desc}"]
         if i < len(steps):
             bt = steps[i].config.body_template if hasattr(steps[i], 'config') else {}
             if bt:
-                # 只显示字段名列表，减少 prompt token 消耗
                 keys = _extract_keys(bt)
                 parts.append(f"     Body 字段: {', '.join(keys)}")
         steps_block_parts.append("\n".join(parts))
     steps_block = "\n".join(steps_block_parts)
 
-    # 检测用户是否只需要正常数据（非测试覆盖场景）
+    # 检测用户是否只需要正常数据
     desc_lower = pipeline_description.lower()
     normal_only = any(kw in desc_lower for kw in [
         "正常数据", "不需要边界", "不需要异常", "只需真实", "仅真实数据",
@@ -212,103 +270,109 @@ def build_pipeline_user_prompt(
     ])
 
     if normal_only:
-        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条正常正向数据"
-        scope_rule = "只生成正向真实数据。禁止边界值、异常值、空值、超长/超短、SQL注入等测试用例。"
-        boundary_section = f"""## 正向数据多样性规则
-用户只需要正常正向数据，不需要边界/异常测试。将 {test_cases_per_step} 条用例全部分配为正向数据：
-- 每条用例的所有字段值都在合法范围内（不测边界、不测异常）
-- 可变字段（数值/文本/枚举）每条用不同的合法值，模拟真实业务场景多样性
-- 数值字段：在合理范围内取不同值（如 1、10、50、100、500）
-- 文本字段：每条用不同的真实场景描述（如 "定期维护"、"零件更换"、"故障修复"）
-- 禁止生成空值、超长、特殊字符、SQL注入等测试数据"""
-    elif test_cases_per_step <= 1:
-        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条正向核心用例"
-        scope_rule = ""
+        scope_hint = f"""## 用户要求：只生成正常正向数据
+禁止边界值、异常值、空值、超长/超短、SQL注入等测试用例。
+mutation 步骤的 {test_cases_per_step} 条全部为正向数据，每条使用不同的合法值模拟真实业务多样性。"""
         boundary_section = ""
-    elif test_cases_per_step <= 5:
-        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条用例，按「边界值覆盖分配规则」严格分配：1条正向 + 剩余覆盖各字段边界（必填/上限/格式）。每条的可变字段值必须不同！"
-        scope_rule = ""
-        boundary_section = f"""## 边界值覆盖分配规则（关键）
-用户描述的每个字段约束（必填/上限/下限等）都必须有对应的边界测试用例。
-将 {test_cases_per_step} 条用例按以下优先级分配，确保每个有约束的字段都被覆盖：
-1. **1 条正向全字段正常值**：所有字段使用合法范围内的典型值
-2. **必填字段边界**：必填字段测缺失/空值/非法类型；数值字段测 0、负数、极大值
-3. **字符串上限字段边界**：每个有字符上限的字段各占 1 条 → 测等于上限（max）、超过上限（max+1）
-   - 例：repairReason 上限100字 → 1条测 100 字、下一条测 101 字
-   - 例：repairContent 上限200字 → 1条测 200 字
-   - 字段多的，合并到同一条用例中（一条用例可同时测多个字段边界）
-4. **异常/非法值**：非法枚举、特殊字符、SQL注入等
-5. **剩余配额**：补充其他等价类或组合边界场景
-
-**注意**：如果 {test_cases_per_step} 条不够覆盖所有字段边界，优先覆盖强约束字段（必填 > 上限 > 格式），并在 case_name 中注明「组合边界」。
-"""
     else:
-        count_hint = f"每个步骤生成恰好 {test_cases_per_step} 条用例，按「边界值覆盖分配规则」分配：正向 + 各字段边界 + 异常 + 等价类。全面覆盖！"
-        scope_rule = ""
-        boundary_section = f"""## 边界值覆盖分配规则（关键）
-用户描述的每个字段约束（必填/上限/下限等）都必须有对应的边界测试用例。
-将 {test_cases_per_step} 条用例按以下优先级分配，确保每个有约束的字段都被覆盖：
-1. **正向全字段正常值**：所有字段使用合法范围内的典型值（占 1-2 条）
-2. **必填字段边界**：必填字段测缺失/空值/非法类型；数值字段测 0、负数、极大值
-3. **字符串上限字段边界**：每个有字符上限的字段各占至少 1 条 → 测等于上限、超过上限
-4. **异常/非法值**：非法枚举、特殊字符、SQL注入等
-5. **等价类组合**：剩余配额覆盖其他等价类或组合边界场景
-"""
+        scope_hint = ""
+        boundary_section = f"""## mutation 步骤边界覆盖（{test_cases_per_step}条分配）
+1. 1-2条正向全字段正常值
+2. 必填字段：缺失/空值/非法类型各1条
+3. 字符串上限字段：等于上限(max)、超过上限(max+1)各1条
+4. 异常值：非法枚举、特殊字符、SQL注入
+5. 剩余配额补充等价类组合
+字段多时合并到同一条用例中。"""
 
-    return f"""请根据用户的 Pipeline 描述生成多步骤测试用例。
+    return f"""请根据 Pipeline 描述生成多步骤测试用例。
 
-## 用户需求（最高优先级，必须严格遵循）
+## 用户需求（最高优先级）
 {pipeline_description}
 
-## 步骤定义
+## 步骤定义（类型和数量已由系统预分类，必须严格遵循）
 {steps_block}
 
-## 如何判断 input_data 放什么（按用户描述决定）
-- 用户说「传参不变」「保持不变」「不修改」「其余传参不变」的步骤
-  → input_data 必须严格为 {{}}（空对象），不要把 body_template 中的任何字段放入 input_data
-  → 仅用户明确说要修改/随机化/动态生成的字段才放入 input_data
-- **查询/列表步骤精简**：GET/查询步骤，用户说「传参不变」时，
-  → {test_cases_per_step} 条用例全部使用相同的 input_data（{{}}），category 全部为 "positive"
-  → 不需要生成 boundary/equivalence/dependency 变体，这些用例会浪费 token 导致截断
-- 用户说「xxx来源于StepN的yyy」 → 不要放入 input_data，改用 data_dependencies 引用
-- 用户没提到的字段 → 不要放入 input_data，保持 Body 默认值
-
-## 步骤间数据传递
-- 用 data_dependencies 字段，占位符格式：{{{{stepN.response.路径}}}}
-- 自然语言 → 占位符翻译示例：
-  「sparePartId来源于step1随机获取的id」
-    → 若 data 为数组：[...] → data_dependencies.body 中用 {{{{step1.response.data[0].id}}}}
-    → 若 data 为对象：{{records:[...]}} → data_dependencies.body 中用 {{{{step1.response.data.records[0].id}}}}
-  「取 Step2 返回的 data.id」→ {{{{step2.response.data.id}}}}
-- **数组索引支持**：
-  * 指定位置：{{{{step1.response.data[2].id}}}} → 获取第 3 个元素的 id（索引从 0 开始）
-  * 随机选取：{{{{step1.response.data.random.id}}}} → 每次随机选取一个元素的 id
-  * 获取长度：{{{{step1.response.data._count}}}} → 获取数组元素个数
-  * 用户说「随机获取」时请使用 random；说「第N个」时请使用 [N-1]
-
-## 动态数据规则
-- 仅 POST/PUT 步骤需要追加 {{{{timestamp}}}} 保证唯一性（如 "刀具名称_{{{{timestamp}}}}"）
-- **重要**：只有名称/编码类需要唯一性的字段才追加 {{{{timestamp}}}}，静态描述字段（如 description）不要追加
-- GET/查询步骤不需要时间戳
-- 纯数字、布尔值、空字符串不需要追加
-- **数据多样性**：仅 POST/PUT 写操作步骤需要多样性！
-  * 查询步骤（GET/传参不变）：{test_cases_per_step} 条用例 input_data 全部相同（{{}} 或相同值），不产生变体
-  * 写操作步骤：可变字段每条不同（数值: 1/50/100/500/999，文本: "正常磨损"/"定期维护"/"突发故障"）
-- **JSON 精简**：每条用例省略空字符串("")、空数组([])、空对象({{}})，只输出有实际内容的字段
+## 期望总数：{expected_total} 条
+{scope_hint}
 
 {boundary_section}
+
+## 跨步骤数据引用（重点！）
+- extractor 步骤：在 extract_fields 中列出要提取的字段名
+  示例：step1 获取 total → extract_fields: ["total"]
+- mutation 步骤：创建后提取新记录ID → extract_fields: ["new_record_id"]
+- verifier 步骤：对比 total 变化 → assertions 中使用 field_diff 类型
+- 后续步骤引用前序数据：data_dependencies.body 中使用 {{stepN.extract.FIELD_NAME}}
+
+## verifier 步骤的断言模板（必须包含 field_diff）
+示例（step3 对比 step1 的 total 是否增加1）：
+"assertions": [
+  {{"type": "code_equals", "expected": "0"}},
+  {{"type": "field_diff", "field": "extract.total", "ref_step": 1,
+   "ref_field": "extract.total", "operator": "equal", "expected_diff": 1}}
+]
+
+## 动态数据规则
+- 仅 mutation 步骤的名称/编码字段追加 {{{{timestamp}}}}
+- extractor/verifier 步骤不需要时间戳
+- 纯数字、布尔值、空字符串不追加
+
 ## 其他要求
-- {count_hint}
-- **重要：每个步骤都要生成恰好 {test_cases_per_step} 条不同的用例！后续步骤也是 {test_cases_per_step} 条！不要只给 Step2+ 生成 1 条！**
-- 每个步骤在 test_cases 同级标注 "output_reference"（如 "data[0].id"）
+- 每个步骤严格生成指定数量的用例
 - expected_status_code 一律 200
-- 正向断言: str(resp_json['code']) == '0'（基本断言，不要强制追加 data 校验）
-- 反向/异常断言: str(resp_json['code']) != '0'（**必须用 str() 包裹，兼容 code 为整数的情况**）
-- 断言必须用 str() 包裹 code，兼容 code 为字符串或整数的情况
-- data 字段是可选的不一定存在！只有用户明确要求校验返回值时才追加 data 断言
-- 断言中可用 isinstance/list/dict 判断 data 类型，也可用 _as_dict() 防御非 dict 类型
-{chr(10) + scope_rule if scope_rule else ""}
-只输出 JSON，不要 Markdown 或额外文字。"""
+- 精简输出：省略空字段
+- 只输出 JSON，不要 Markdown 或额外文字"""
+
+
+def _classify_steps(pipeline_description: str, steps: list) -> list[str]:
+    """根据用户描述 + HTTP方法自动分类步骤类型。
+
+    分类顺序（优先级从高到低）：
+    1. HTTP 方法信号：PUT/DELETE/PATCH 直接 → mutation
+    2. 用户描述关键词
+    3. 兜底默认
+
+    返回: ["extractor", "mutation", "verifier", ...]
+    """
+    result = []
+    desc_parts = pipeline_description.split("\n")
+
+    for i, step in enumerate(steps):
+        method = step.config.method.upper() if hasattr(step, 'config') else "POST"
+
+        # 收集该步骤相关的描述文本
+        step_text = pipeline_description
+        for part in desc_parts:
+            if f"step{i+1}" in part.lower() or f"Step{i+1}" in part:
+                step_text = part
+                break
+
+        # ── 1. HTTP 方法强信号 ──
+        # PUT/DELETE/PATCH 必定是 mutation（编辑/删除）
+        if method in ("PUT", "DELETE", "PATCH"):
+            result.append("mutation")
+            continue
+
+        # ── 2. 用户描述关键词 ──
+        # verifier 关键词（需在 extractor 之前检查，因为 "对比" 含查询语义但更强）
+        if any(kw in step_text for kw in STEP_TYPE_RULES["verifier"]["keywords"]):
+            result.append("verifier")
+            continue
+
+        # extractor 关键词
+        if any(kw in step_text for kw in STEP_TYPE_RULES["extractor"]["keywords"]):
+            result.append("extractor")
+            continue
+
+        # ── 3. GET 默认 extractor ──
+        if method == "GET":
+            result.append("extractor")
+            continue
+
+        # ── 4. POST 默认 mutation ──
+        result.append("mutation")
+
+    return result
 
 
 def build_user_prompt(field_requirements: str, api_url: str = "", method: str = "POST") -> str:
